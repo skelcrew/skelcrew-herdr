@@ -1,20 +1,11 @@
 // Skelcrew's sessions, transport and status on herdr-core. Each function takes and returns plain
 // data, so phase 5's runtime plugin can call it from its call handler unchanged. A session is an
 // hc terminal, named by Skelcrew, with labels for its repository, task and role.
-import {
-  closeSync,
-  constants,
-  mkdirSync,
-  openSync,
-  readFileSync,
-  rmSync,
-  statSync,
-  writeSync,
-} from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { closeSync, constants, mkdirSync, openSync, rmSync, statSync, writeSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
-import { HcError, hc, hcBin, hcEnv, lines, rpc } from "./hc.ts";
+import { ensureCore, HcError, hc, hcBin, hcEnv, lines, rpc } from "./hc.ts";
 
 // A session's name, which is its ID: hc's rule for a terminal's name, unique among live ones.
 export const Session = z.string().regex(/^[a-z0-9_-]{1,32}$/, "1-32 of a-z, 0-9, - and _");
@@ -165,11 +156,13 @@ export async function end(q: z.infer<typeof End>) {
   return {};
 }
 
-// The command that attaches your terminal to the session, for Skelcrew to run in your terminal.
-// Ctrl+\ detaches, hc's key, not Skelcrew's Alt-Q.
+// The command that attaches your terminal to the session, for Skelcrew to run in your terminal,
+// with the environment it needs on top of yours to reach Skelcrew's core. Ctrl+\ detaches,
+// hc's key, not Skelcrew's Alt-Q.
 export const Attach = z.object({ session: Session });
 export function attach(q: z.infer<typeof Attach>) {
-  return { argv: [hcBin(), "attach", q.session] };
+  const { HC_SESSION, XDG_CONFIG_HOME } = hcEnv();
+  return { argv: [hcBin(), "attach", q.session], env: { HC_SESSION, XDG_CONFIG_HOME } };
 }
 
 // Waits until the agent isn't working, for at most `timeout` seconds, by following hc's events.
@@ -178,6 +171,7 @@ export function attach(q: z.infer<typeof Attach>) {
 // session ended or went.
 export const Idle = z.object({ session: Session, timeout: z.number().min(0).default(50) });
 export async function idle(q: z.infer<typeof Idle>) {
+  await ensureCore();
   const child = Bun.spawn([hcBin(), "events", "--terminal", q.session, "--json"], {
     env: hcEnv(),
     stdin: "ignore",
@@ -220,40 +214,26 @@ export const Marks = z.object({ busy: z.string().min(1), prompt: z.string().min(
 export type Marks = z.infer<typeof Marks>;
 
 // Returns why the screen shows the agent not ready for a message, or empty text when its prompt
-// is bare. Text after the prompt's mark is a person's unsent draft. A numbered menu, such as a
-// permission question, also puts the mark before text, and isn't ready either. hc's read drops
-// trailing spaces, so a bare prompt is the mark alone.
+// is empty. The prompt's mark is its first word, such as `❯` for Claude Code or `›` for Codex,
+// and the rest is the placeholder an empty prompt shows, such as Codex's `Ask Codex to do
+// anything`, which typing replaces. So the last line starting with the mark is where a message
+// goes: the mark alone or with its placeholder is empty, and anything else after it is a
+// person's unsent draft. A numbered menu, such as a permission question, also puts the mark
+// before text, and isn't ready either. hc's read drops trailing spaces.
 export function notReady(shown: string, marks: Marks): string {
   if (shown.includes(marks.busy)) return `it shows ${marks.busy}`;
-  const mark = marks.prompt.trim();
+  const empty = marks.prompt.trim();
+  const mark = empty.split(/\s+/)[0] ?? empty;
   const input = shown
     .split("\n")
     .map((line) => line.trim())
     .findLast((line) => line === mark || line.startsWith(`${mark} `));
   if (input === undefined) return `it shows no ${mark} prompt`;
-  if (input === mark) return "";
+  if (input === mark || input === empty) return "";
   if (/^\S+ \d+\. /.test(input)) return "it shows a menu";
   return draftReason;
 }
 const draftReason = "a person's unsent draft is at its prompt";
-
-// How long hc holds a send for a person's draft after their last key: `draft_wait` in hc's
-// config.toml, in seconds, 60 when unset. Read each time, as hc does. The core reads the same
-// file when it runs with the same XDG_CONFIG_HOME and HOME as this process.
-export function draftWait(): number {
-  const home = process.env.XDG_CONFIG_HOME || join(homedir(), ".config");
-  let config = "";
-  try {
-    config = readFileSync(join(home, "herdr-core", "config.toml"), "utf8");
-  } catch {}
-  const set = config.match(/^\s*draft_wait\s*=\s*([-+0-9.eE]+)\s*(#.*)?$/m)?.[1];
-  const seconds = set === undefined ? 60 : Number(set);
-  return Number.isFinite(seconds) ? Math.max(0, seconds) : 60;
-}
-
-// How much sooner than hc's draft hold could end a held send is cancelled: time for a key typed
-// just before the last look to reach the screen, and for the cancel to reach the core.
-const margin = 500;
 
 // Types `text` and Enter into the agent once it isn't working, never into a running turn and
 // never onto a person's unsent draft, waiting at most `timeout` seconds. Answers whether it
@@ -265,13 +245,12 @@ const margin = 500;
 // idle, with the message `delivering`, and its status is put back afterwards unless Skelcrew
 // reported another meanwhile. A report of working while the send is held then stops it.
 //
-// Never onto a draft: hc holds a send while a person has a draft, but only `draft_wait`
-// seconds after their last key, then types on top of it. So a send goes only once the screen
-// shows a bare prompt, by the harness's `marks`, which also catches a draft hc stopped holding.
-// A draft started after that look holds the send in hc for `draft_wait` from its first key, and
-// the send is cancelled before then. hc honours a cancel only before typing, so it is certain.
-// After typing, hc watches up to 5 seconds for the agent to start working, so the answer can
-// come that much after the deadline.
+// Never onto a draft: hc holds a send while a person has a draft, the screen shows it or not,
+// and on Skelcrew's core that hold has no end (see hc.ts). A send goes only once the screen
+// shows an empty prompt, by the harness's `marks`, which also catches a draft hc never saw, such
+// as one typed before the core restarted. A send still held at the deadline is cancelled, which
+// hc honours only before typing, so the answer is certain. After typing, hc watches up to 5
+// seconds for the agent to start working, so the answer can come that much after the deadline.
 export const Deliver = z.object({
   session: Session,
   text: z.string().min(1),
@@ -281,9 +260,6 @@ export const Deliver = z.object({
 export async function deliver(q: z.infer<typeof Deliver>) {
   const deadline = Date.now() + q.timeout * 1000;
   const left = () => Math.max(0, deadline - Date.now());
-  const hold = draftWait() * 1000 - margin;
-  if (hold <= 0)
-    return { delivered: false, why: `hc's draft_wait is too short to keep a person's draft safe` };
   while (true) {
     const t = await get(q.session);
     if (t.state !== "live") return { delivered: false, why: "it has ended" };
@@ -303,19 +279,17 @@ export async function deliver(q: z.infer<typeof Deliver>) {
       await Bun.sleep(Math.min(250, left()));
       continue;
     }
-    const looked = Date.now();
     const shown = t.status ?? { state };
     if (state !== "idle" && !(await report(q.session, shown, delivering))) continue;
     try {
       const send = { terminal: q.session, text: q.text, if: "idle" };
-      await rpc("terminal.send", send, Math.min(left(), looked + hold - Date.now()));
+      await rpc("terminal.send", send, left());
       return { delivered: true };
     } catch (error) {
       if (!(error instanceof HcError)) throw error;
       // The status changed before typing: look again.
       if (error.kind === "status_mismatch") continue;
-      // Held until the deadline, or so long that hc may soon type onto a draft. Trying again
-      // could find hc's hold over for a draft the screen doesn't show, so this is the answer.
+      // Held by a person's typing until the deadline.
       if (error.kind === "cancelled")
         return { delivered: false, why: "a person's typing at its prompt held it" };
       throw error;

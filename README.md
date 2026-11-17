@@ -16,14 +16,23 @@ echo '{"ask":"list"}' | bun src/call.ts
 | `keys` | `session`, `keys` such as `["esc"]` | | `hc keys` |
 | `interrupt` | `session`, `timeout` | `key`, `outcome` | `hc interrupt` |
 | `end` | `session` | | `hc kill`, then `hc rm` |
-| `attach` | `session` | `argv` for Skelcrew to run in your terminal | `hc attach` (Ctrl+\ detaches) |
-| `deliver` | `session`, `text`, the harness's screen `marks` (`busy`, `prompt`), `timeout` | `delivered`, and `why` when not | `hc read`, then `terminal.send` with `if: idle`, cancelled before hc's draft hold could end |
+| `attach` | `session` | `argv` for Skelcrew to run in your terminal, and the `env` it needs on top of yours | `hc attach` (Ctrl+\ detaches) |
+| `deliver` | `session`, `text`, the harness's screen `marks` (`busy`, `prompt`), `timeout` | `delivered`, and `why` when not | `hc read`, then `terminal.send` with `if: idle`, cancelled at the deadline |
 | `idle` | `session`, `timeout` | `idle`, `status`, and `ended` | `hc events --terminal` |
 | `status` | `session`, `status`, `reason` | the `status` hc then shows | OSC 7501 written to the session's terminal |
 
 `status` takes Skelcrew's words and answers in them: `working`, `idle`, `needs you`, `ready`, `error`. In OSC 7501 they become `working`, `idle`, `blocked` (with `kind=question` or `kind=permission` when that is the reason), `done` and `error`, and the reason goes in as the message.
 
-hc is found as `HC_BIN`, or `hc` on `PATH`. Which core it reaches is up to hc: `HC_SESSION`, `HC_SOCKET` and the XDG folders pass through. `HC_TERMINAL_ID` and `HC_SCOPE` are dropped, so an engine running inside an hc terminal doesn't make its agents that terminal's children.
+hc is found as `HC_BIN`, or `hc` on `PATH`. `HC_TERMINAL_ID` and `HC_SCOPE` are dropped from hc's environment, so an engine running inside an hc terminal doesn't make its agents that terminal's children.
+
+### Skelcrew's own hc core
+
+The agents run on an hc core of their own, the hc session `skelcrew` (`SKELCREW_HC_SESSION` changes it), the way they run on Skelcrew's own tmux server today.
+
+- **Its own config.** That core reads a config file this program writes and owns, in `$XDG_STATE_HOME/skelcrew-herdr/config/herdr-core/config.toml` (`SKELCREW_HERDR_HOME` moves the folder). It sets `notes = false` and `draft_wait = 1000000000`: a person's draft holds a send for over 31 years after their last key. It never reads the person's own `config.toml`, so nothing there can shorten the hold or have a different meaning.
+- **Started and checked by this program.** Every call first runs `hc server start` on that session, with that config folder and only the environment a core needs. If the core is already running, that just returns its pid, and its environment must show the same config folder. A core started any other way is refused with an error saying how to stop it. That includes one started by any hc command run on that session, which starts a core on the person's config if none runs.
+- **Reaching it.** Every hc command here runs with `HC_SESSION` and `XDG_CONFIG_HOME` set to Skelcrew's, and without `HC_SOCKET`. So does `attach`, through the `env` it answers.
+- **For herdr's apps.** To show Skelcrew's agents, they must look at that session.
 
 ## Tests
 
@@ -32,7 +41,7 @@ bun install
 bun run check    # biome, tsc, and bun test
 ```
 
-The tests run against a real hc core. They start their own core, with its own `HC_SESSION`, state, config and socket folders, so they never touch the machine's own core or its terminals, and they stop it at the end. Without `hc` on `PATH` or in `HC_BIN`, they are skipped, and say why. To get hc:
+The tests run against a real hc core. They start their own Skelcrew core, with its own session, state, config and socket folders, so they never touch the machine's own core or its terminals, and they stop it at the end. Without `hc` on `PATH` or in `HC_BIN`, they are skipped, and say why. To get hc:
 
 ```sh
 curl -fsSL https://releases.herdr.dev/core/install.sh | HC_INSTALL_DIR=~/.local/bin sh
@@ -60,7 +69,7 @@ Tested with hc 0.1.21.
 
 - **Sessions that outlive the engine.** Terminals outlive the client that started them, and the core keeps their records. `hc server restart` and `hc update` keep programs running. An agent that exits keeps its record and last screen until `hc rm`, with how it ended (`reason`, `exit_code`), as `remain-on-exit` does on tmux.
 - **Labels, kept by the core.** `terminal.list` filters on them, so a starting engine finds its sessions again.
-- **A transport with a draft check built in.** `send` holds while a person has an unsent draft, for up to `draft_wait` after their last key, and `if: idle` types only if the status is still idle at that moment. Each terminal has one input queue, so two sends never interleave, nor a send and a person typing. A cancelled send is never typed.
+- **A transport with a draft check built in.** `send` holds while a person has an unsent draft, whether the screen shows it or not, for up to `draft_wait` after their last key, and `if: idle` types only if the status is still idle at that moment. Each terminal has one input queue, so two sends never interleave, nor a send and a person typing. A cancelled send is never typed.
 - **Events.** `hc events` streams status, turn, finished and label changes, so `idle` waits on an event instead of polling the screen.
 - **Status in herdr's apps** through OSC 7501, with a turn counter.
 - **An API.** JSON-RPC over a socket or `hc connect`, described by `hc schema`. It also covers remote machines (`hc run --on box`), which Skelcrew could use later.
@@ -72,7 +81,7 @@ Tested with hc 0.1.21.
 - **Status of its own.** hc never infers status from the screen. Its status is only what was written to the terminal as OSC 7501. Here that is whatever Skelcrew reports, so hc's idle is Skelcrew's idle passed back: `deliver` and `idle` depend on `status` being called on every change.
 - **A paste without Enter.** `send` is always paste then Enter. That covers `deliver`, but not the `paste` that the v6 sessions table lists for the built-in transport. That transport isn't needed on hc, since hc's own is better, so this prototype has no `paste`.
 - **Skelcrew's detach key.** `hc attach` detaches with Ctrl+\, not Alt-Q.
-- **The machine's own core, untouched.** The first hc command starts a core if none runs, and that core passes its environment to every terminal. The engine should start the core itself from a clean environment, or use one started by `hc server start` at login.
+- **A core that is safe whoever starts it.** The first hc command starts a core if none runs, with that command's environment and config, and the core passes its environment to every terminal. That is why this program starts Skelcrew's core itself and refuses one started otherwise.
 
 ## How status reaches herdr
 
@@ -94,10 +103,7 @@ The engine runs as the same user, so it can open the device, and the sandbox nev
 
 - **Only `if: idle` guards typing, so every delivery goes through it.** hc checks `if` at the moment it types, however long the send was held, and that is the only check that holds through a hold. But `if` takes only `idle` or `working`, and ready shows as `done`, needs you as `blocked`. So for a ready, errored, or needs-you agent with no dialog open, `deliver` first reports `idle` with the message `delivering`, sends with `if: idle`, and afterwards puts back the status it displaced, unless Skelcrew reported another meanwhile. A report of working while the send is held then stops it. A delivery held for a long time shows the agent as idle (delivering) meanwhile. Reports for one session take turns through a lock (a folder in the temp dir), and each waits until hc shows it, so putting a status back can never undo a newer report. hc refuses to type into `blocked` anyway without `force`, since typing would answer the dialog.
 - **Giving up on a send must be done by cancelling it, not by killing `hc send`.** After typing, a send watches up to 5 seconds (`HC_STARTED_MS`) for the agent to start working. A killed CLI can't tell "held by a draft, nothing typed" from "typed, still watching". Only framed mode answers `$/cancelRequest`: hc cancels only before typing, and answers `cancelled` or the result. That certainty is what keeps a message from being typed twice, so `deliver` speaks framed mode over `hc connect` for this one call. Plain mode cancels only by hanging up, and then sends no answer.
-- **hc's draft hold isn't "never", so `deliver` adds two checks.** A send waits while a person has a draft, but only up to `draft_wait` (60 seconds by default) after their last key, and then types on top of it. Skelcrew's rule is never.
-  - **A draft already there.** `deliver` sends only once the screen shows a bare prompt, read by the harness's marks as Skelcrew's built-in transport reads them. That catches a draft hc stopped holding.
-  - **A draft started after that look.** hc holds the send for at least `draft_wait` from that draft's first key, so `deliver` cancels the send half a second before `draft_wait` from the look could run out. It reads `draft_wait` from hc's `config.toml`, so the core must use the same config folder. A send cancelled that way answers `delivered: false` rather than trying again, since a draft the screen doesn't show could be there with hc's hold already over. With `draft_wait` under a second, nothing is delivered. A short `draft_wait` also means more deliveries fail: in an agent's first 10 seconds, or just after its screen changed, hc waits for the screen to settle before typing.
-  - **What this can't catch.** A draft the screen never shows, typed more than `draft_wait` before the look.
+- **hc's draft hold isn't "never" by default.** A send waits while a person has a draft, but only up to `draft_wait` (60 seconds by default) after their last key, and then types on top of it. Skelcrew's rule is never. Only hc knows about a draft the screen doesn't show, since it counts the person's keys, and nothing outside hc can see that count. So the only guard that covers every draft is a hold that doesn't end. That needs Skelcrew's own core with its own config, as above. On top of that, `deliver` sends only once the screen shows an empty prompt, read by the harness's marks as Skelcrew's built-in transport reads them. That catches a draft hc never counted, such as one typed before the core restarted. The prompt's mark is its first word, and the rest is the placeholder an empty prompt shows, such as Codex's `› Ask Codex to do anything`, which typing replaces.
 - **Interrupt.** `hc interrupt` presses Esc for a program that ever reported a status, which every session has once `status` ran, and ctrl+c for one that never did. It then waits for the status to leave `working`. Claude Code has no hook for Esc, so hc says `still_working` until Skelcrew's screen check reports `idle`. Its outcome is advisory.
 - **`hc ls --json` has no labels.** `list` uses the API's `terminal.list`, which gives whole records.
 - **Every send waits for a starting agent to settle.** During an agent's first 10 seconds, a send first waits, up to 5 seconds, for the screen to stop changing.
@@ -108,8 +114,10 @@ The engine runs as the same user, so it can open the device, and the sandbox nev
 2. **Who calls `status`, and how often?** hc's idle is only what Skelcrew reported. If a call is missed or arrives late, `deliver` waits on a stale status. Should the engine report again when it starts, for every running session?
 3. **Can anything print a fake status?** Anything that prints OSC 7501 to the terminal changes hc's status, including the agent printing a file that holds one. A false `idle` would let `deliver` type into a running turn. `deliver`'s screen check also refuses a screen that shows the harness's busy mark, which covers most of that. Is that enough?
 4. **Status from the API.** Ask herdr-core for a `terminal.status` call, or keep writing to the tty (see above)? Either way, if a harness ever writes OSC 7501 itself, two writers will fight over the root record. Should Skelcrew then report under a child record (`id=skelcrew`)?
-5. **Never typing onto a draft, and guarding other states, in hc itself.** A per-send option to hold for a draft with no time limit, and `if` taking any status word, such as `if: done`, would remove `deliver`'s screen check, its cancel window, and its temporary `idle` report. Ask herdr-core for them? Setting `draft_wait` in the user's `config.toml` instead would change it for all their terminals.
+5. **Never typing onto a draft, and guarding other states, in hc itself.** Two things would let Skelcrew run on the person's own core, and remove `deliver`'s temporary `idle` report. Ask herdr-core for them?
+   - A per-send option to hold for a draft with no time limit.
+   - `if` taking any status word, such as `if: done`.
 6. **Which labels does herdr's app group by?** This prototype uses `repo`, `task` and `role`, plus `by=skelcrew` to find its own. Should Skelcrew prefix them (`skelcrew.repo`), and will herdr's app group by `repo`?
 7. **Session IDs.** The ID here is the hc name Skelcrew gives (a-z, 0-9, `-` and `_`, at most 32), unique among live terminals only. A finished one keeps the name until `end` removes it, and `start` under that name fails until then. Should the ID be hc's address (`t7`) instead, or both?
-8. **Which core?** The machine's default one, so herdr's apps see the agents, or a session of Skelcrew's own (`HC_SESSION=skelcrew`), like Skelcrew's own tmux server? The second keeps Skelcrew's agents apart, but herdr's apps would have to look at that session.
+8. **Which core?** This prototype uses a session of Skelcrew's own, since only a config of its own keeps every draft safe today. herdr's apps then have to look at that session too. Can they show more than one session, or should herdr-core take a draft hold per send (question 5), so Skelcrew can run on the default core?
 9. **Attach.** Should `attach` answer with a command for Skelcrew to run, as here, or run in the terminal itself, as v6's `attach:` manifest entry does?

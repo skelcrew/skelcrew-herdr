@@ -6,7 +6,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { answer } from "../src/call.ts";
-import { hc } from "../src/hc.ts";
+import { ensureCore, hc } from "../src/hc.ts";
 import * as host from "../src/host.ts";
 
 const bin = process.env.HC_BIN || Bun.which("hc");
@@ -31,8 +31,11 @@ beforeAll(async () => {
     delete process.env[key];
   Object.assign(process.env, {
     HC_BIN: bin,
-    HC_SESSION: `test${process.pid}`,
+    // Skelcrew's core for these tests, and this program's files, with its config.
+    SKELCREW_HC_SESSION: `test${process.pid}`,
+    SKELCREW_HERDR_HOME: join(scratch, "plugin"),
     XDG_STATE_HOME: join(scratch, "state"),
+    // A person's own hc config, which Skelcrew's core never reads.
     XDG_CONFIG_HOME: join(scratch, "config"),
     XDG_RUNTIME_DIR: sockets,
     // A person's key holds an agent's send this long, 3s by default.
@@ -42,10 +45,8 @@ beforeAll(async () => {
     HC_STARTED_MS: "300",
   });
   mkdirSync(join(scratch, "config", "herdr-core"), { recursive: true });
-  // No notes typed into terminals on hc's own.
-  configure("");
   mkdirSync(join(scratch, "work"));
-  await hc(["server", "start"]);
+  await ensureCore();
 });
 
 afterAll(async () => {
@@ -56,10 +57,10 @@ afterAll(async () => {
   rmSync(sockets, { recursive: true, force: true });
 });
 
-// Writes the core's config.toml, which hc reads again for each delivery. No notes are typed into
-// terminals on hc's own.
-function configure(extra: string) {
-  writeFileSync(join(scratch, "config", "herdr-core", "config.toml"), `notes = false\n${extra}`);
+// Writes a person's own hc config.toml, which a core started on it would read, and hc reads
+// again for each delivery.
+function personConfig(text: string) {
+  writeFileSync(join(scratch, "config", "herdr-core", "config.toml"), text);
 }
 
 // The status hc shows for the session, in Skelcrew's words.
@@ -105,7 +106,7 @@ async function attachPerson(session: string) {
       : ["script", "-qfc", `${bin} attach ${session}`, "/dev/null"];
   // Bun hands a child the environment it started with unless given process.env as it is now.
   const person = Bun.spawn(argv, {
-    env: process.env,
+    env: { ...process.env, ...host.attach({ session }).env },
     stdin: "pipe",
     stdout: "pipe",
     stderr: "ignore",
@@ -216,7 +217,13 @@ describe.skipIf(!bin)("sessions on herdr-core", () => {
   }, 15_000);
 
   test("attach is hc attach on the session", () => {
-    expect(host.attach({ session: "agent-1" })).toEqual({ argv: [bin ?? "", "attach", "agent-1"] });
+    expect(host.attach({ session: "agent-1" })).toEqual({
+      argv: [bin ?? "", "attach", "agent-1"],
+      env: {
+        HC_SESSION: process.env.SKELCREW_HC_SESSION,
+        XDG_CONFIG_HOME: join(scratch, "plugin", "config"),
+      },
+    });
   });
 });
 
@@ -309,8 +316,7 @@ describe.skipIf(!bin)("transport on herdr-core", () => {
     }
   }, 30_000);
 
-  test("a draft older than hc's draft_wait still holds a delivery", async () => {
-    configure("draft_wait = 1\n");
+  test("a draft holds a delivery however old it is", async () => {
     const session = await startAgent();
     const person = await attachPerson(session);
     try {
@@ -335,54 +341,63 @@ describe.skipIf(!bin)("transport on herdr-core", () => {
       expect(shown).not.toContain("AUTOMATED");
       expect(shown).not.toContain("LATER");
       person.type("\x15");
-      // With draft_wait at 1, a send has half a second before it is cancelled, less than hc
-      // waits for a screen that just changed to settle. So back to the default.
-      configure("");
       expect(await host.deliver({ session, text: "cleared", marks, timeout: 5 })).toEqual({
         delivered: true,
       });
       await screenShows(session, "got: cleared");
     } finally {
       await person.detach();
-      configure("");
     }
   }, 30_000);
 
-  test("a send hc holds for a draft is cancelled before hc's hold runs out", async () => {
-    configure("draft_wait = 2\n");
+  test("a draft the screen doesn't show holds a delivery however old it is", async () => {
     const session = await startAgent();
     await host.status({ session, status: "idle", reason: "" });
     const person = await attachPerson(session);
+    // A person's own config can't shorten the hold on Skelcrew's core, however it is written.
+    const configs = [
+      ["draft_wait = 2\n", 3000],
+      ['"draft_wait" = 0\n', 500],
+      ["'draft_wait' = 0.0 # off\n", 500],
+      ["[x]\n", 500],
+    ] as const;
     try {
-      // A draft the screen doesn't show, typed just before the delivery looks.
-      person.type("\x02draft");
-      await Bun.sleep(100);
-      const started = Date.now();
-      expect(await host.deliver({ session, text: "ONTOP", marks, timeout: 10 })).toEqual({
-        delivered: false,
-        why: "a person's typing at its prompt held it",
+      for (const [config, age] of configs) {
+        personConfig(config);
+        person.type("\x02draft");
+        await Bun.sleep(age);
+        expect(host.notReady(await screen(session), marks)).toBe("");
+        expect(await host.deliver({ session, text: "ONTOP", marks, timeout: 1.5 })).toEqual({
+          delivered: false,
+          why: "a person's typing at its prompt held it",
+        });
+        await Bun.sleep(500);
+        expect(await screen(session)).not.toContain("ONTOP");
+        person.type("\x15");
+      }
+      expect(await host.deliver({ session, text: "cleared", marks, timeout: 5 })).toEqual({
+        delivered: true,
       });
-      expect(Date.now() - started).toBeLessThan(2000);
-      // hc's hold has run out by now, and nothing was typed.
-      await Bun.sleep(1500);
-      expect(await screen(session)).not.toContain("ONTOP");
-      person.type("\x15");
+      const shown = await screenShows(session, "got: cleared");
+      expect(shown).not.toContain("draftONTOP");
     } finally {
       await person.detach();
-      configure("");
+      personConfig("");
     }
-  }, 20_000);
+  }, 40_000);
 
-  test("a draft_wait too short to keep a draft safe delivers nothing", async () => {
-    configure("draft_wait = 0\n");
+  test("a core for the session started without this program's config is refused", async () => {
+    const own = process.env.SKELCREW_HC_SESSION;
+    const other = `other${process.pid}`;
+    // Started as any hc command would start it, on the person's own config.
+    const env = { ...process.env, HC_SESSION: other };
+    Bun.spawnSync([bin ?? "hc", "server", "start", "--json"], { env, stdout: "ignore" });
+    process.env.SKELCREW_HC_SESSION = other;
     try {
-      const session = await startAgent();
-      await host.status({ session, status: "idle", reason: "" });
-      expect(await host.deliver({ session, text: "x", marks, timeout: 1 })).toMatchObject({
-        delivered: false,
-      });
+      await expect(host.list()).rejects.toThrow("wasn't started by skelcrew-herdr");
     } finally {
-      configure("");
+      process.env.SKELCREW_HC_SESSION = own;
+      Bun.spawnSync([bin ?? "hc", "server", "stop", "--json"], { env, stdout: "ignore" });
     }
   }, 15_000);
 
@@ -504,8 +519,9 @@ describe.skipIf(!bin)("the call handler", () => {
   });
 
   test("calls the same functions", async () => {
-    const argv = [bin ?? "", "attach", "x"];
-    expect(await answer({ ask: "attach", session: "x" })).toEqual({ argv });
+    expect(await answer({ ask: "attach", session: "x" })).toMatchObject({
+      argv: [bin ?? "", "attach", "x"],
+    });
   });
 });
 
@@ -522,4 +538,15 @@ test("notReady tells a bare prompt from a draft, a menu and a busy screen", () =
   expect(host.notReady("> 1. Yes", marks)).toBe("it shows a menu");
   expect(host.notReady(">\nesc to interrupt", marks)).toBe("it shows esc to interrupt");
   expect(host.notReady("loading", marks)).toBe("it shows no > prompt");
+});
+
+test("notReady reads Skelcrew's Codex and Claude Code marks", () => {
+  const codex = { busy: "esc to interrupt", prompt: "› Ask Codex to do anything" };
+  expect(host.notReady("› Ask Codex to do anything", codex)).toBe("");
+  expect(host.notReady("› Ask Codex to do anything\n› my unsent draft", codex)).toBe(draftReason);
+  expect(host.notReady("› my unsent draft", codex)).toBe(draftReason);
+  expect(host.notReady("› earlier message\n\n› Ask Codex to do anything", codex)).toBe("");
+  const claude = { busy: "esc to interrupt", prompt: "❯" };
+  expect(host.notReady("❯ hi\n⏺ Hello\n❯", claude)).toBe("");
+  expect(host.notReady("❯ draft", claude)).toBe(draftReason);
 });
