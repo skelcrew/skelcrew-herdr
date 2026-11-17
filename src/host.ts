@@ -91,7 +91,8 @@ export const Start = z.object({
 });
 export async function start(q: z.infer<typeof Start>) {
   const env = Object.entries(q.env).map(([k, v]) => `${k}=${v}`);
-  const clean = ["/usr/bin/env", "-i", ...env];
+  // `--` ends env's options, so a name starting with - is set, not read as an option.
+  const clean = ["/usr/bin/env", "-i", "--", ...env];
   const run = {
     argv: [...clean, ...q.argv],
     cwd: q.folder,
@@ -332,8 +333,15 @@ export async function deliver(q: z.infer<typeof Deliver>) {
       await Bun.sleep(Math.min(250, left()));
       continue;
     }
+    // Nothing is sent once the time is up, as a send can type before its cancel arrives.
+    const late = { delivered: false, why: "its time ran out before it was ready" };
+    if (left() === 0) return late;
     const shown = t.status ?? { state };
     if (state !== "idle" && !(await report(q.session, shown, delivering))) continue;
+    if (left() === 0) {
+      if (state !== "idle") await report(q.session, delivering, shown);
+      return late;
+    }
     const send = { terminal: q.session, text: q.text, if: "idle" };
     const failed = await rpc("terminal.send", send, left()).then(
       () => null,

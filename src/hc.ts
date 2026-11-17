@@ -9,6 +9,7 @@
 // own hold ends `draft_wait` after a person's last key, and then hc types on top of the draft.
 // Nothing outside hc can see a draft the screen doesn't show, so only a hold that never ends
 // keeps every draft safe.
+import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -89,6 +90,7 @@ export async function ensureCore(): Promise<void> {
     ...env,
     HC_SESSION: hcSession(),
     XDG_CONFIG_HOME: home,
+    SKELCREW_HERDR_CORE: coreMark(),
   });
 }
 
@@ -97,9 +99,14 @@ export async function stopCore(): Promise<void> {
   await run(["server", "stop"], 30_000, hcEnv());
 }
 
-// Throws unless the core with this pid reads Skelcrew's config.
+// The mark a core started by this program carries in its environment: a hash of its config
+// folder, which holds no spaces, so it reads back whole from ps on a Mac, where a folder's own
+// name could hold spaces.
+export const coreMark = () => createHash("sha256").update(configHome()).digest("hex").slice(0, 32);
+
+// Throws unless the core with this pid was started by this program on Skelcrew's config.
 function checkCore(pid: number | undefined): void {
-  if (pid && envOf(pid, "XDG_CONFIG_HOME") === configHome()) return;
+  if (pid && startedHere(pid)) return;
   throw new HcError(
     "config",
     `the hc core for session ${hcSession()} (pid ${pid}) wasn't started by skelcrew-herdr, so ` +
@@ -107,15 +114,27 @@ function checkCore(pid: number | undefined): void {
   );
 }
 
-// Returns one variable of a process's environment: from /proc on Linux, and from ps on a Mac,
-// which prints a process's environment after its command. Undefined when it can't be read.
-function envOf(pid: number, key: string): string | undefined {
+// Reports whether a process's environment says this program started it on Skelcrew's config.
+// On Linux, /proc gives each variable whole, so its config folder is compared too. A Mac has no
+// /proc, and ps prints the environment after the command with spaces between, which a value
+// could hold too, so there only the mark is looked for, as a whole word.
+function startedHere(pid: number): boolean {
+  let vars: string[] | undefined;
   try {
-    const vars = readFileSync(`/proc/${pid}/environ`, "utf8").split("\0");
-    return vars.find((v) => v.startsWith(`${key}=`))?.slice(key.length + 1);
+    vars = readFileSync(`/proc/${pid}/environ`, "utf8").split("\0");
   } catch {}
+  if (vars)
+    return (
+      vars.includes(`XDG_CONFIG_HOME=${configHome()}`) &&
+      vars.includes(`SKELCREW_HERDR_CORE=${coreMark()}`)
+    );
   const ps = Bun.spawnSync(["ps", "-wwE", "-o", "command=", "-p", String(pid)], { stdout: "pipe" });
-  return ps.stdout.toString().match(new RegExp(` ${key}=(\\S*)`))?.[1];
+  return markedIn(ps.stdout.toString(), coreMark());
+}
+
+// Reports whether ps's line for a process, its command then its environment, holds the mark.
+export function markedIn(psLine: string, mark: string): boolean {
+  return psLine.split(/\s+/).includes(`SKELCREW_HERDR_CORE=${mark}`);
 }
 
 // Runs `hc <command> --json <args>` and returns its parsed answer, only for the server commands,

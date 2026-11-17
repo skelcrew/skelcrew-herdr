@@ -6,7 +6,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { answer } from "../src/call.ts";
-import { ensureCore, rpc, stopCore } from "../src/hc.ts";
+import { coreMark, ensureCore, markedIn, rpc, stopCore } from "../src/hc.ts";
 import * as host from "../src/host.ts";
 
 const bin = process.env.HC_BIN || Bun.which("hc");
@@ -154,6 +154,20 @@ describe.skipIf(!bin)("sessions on herdr-core", () => {
     const env = JSON.parse(shown.match(/env: (\[.*\])/)?.[1] ?? "[]") as string[];
     expect(env).toEqual(["COLORTERM", "FAKE_TOKEN", "PATH", "TERM", "TERM_PROGRAM"]);
     expect(shown).toContain(`terminal: ${JSON.stringify(["dumb", "custom", "custom"])}`);
+  }, 15_000);
+
+  test("start sets an environment name that starts with -, rather than reading it as an option", async () => {
+    const session = "dash-env";
+    started.push(session);
+    await host.start({
+      session,
+      argv: [process.execPath, fakeAgent],
+      folder: scratch,
+      env: { PATH: "/usr/bin:/bin", "-FOO": "bar" },
+      labels: { repo: "simon/app", role: "builder" },
+    });
+    const shown = await screenShows(session, "token:");
+    expect(shown).toContain(`env: ${JSON.stringify(["-FOO", "PATH"])}`);
   }, 15_000);
 
   test("list finds Skelcrew's sessions with their labels, and not others", async () => {
@@ -524,6 +538,18 @@ describe.skipIf(!bin)("transport on herdr-core", () => {
     expect(shown).not.toContain("got: moving");
   }, 30_000);
 
+  test("deliver types nothing once its time is up", async () => {
+    const session = await startAgent();
+    await host.status({ session, status: "idle", reason: "" });
+    for (const timeout of [0, 0.3]) {
+      expect(await host.deliver({ session, text: "too late", marks, timeout })).toMatchObject({
+        delivered: false,
+      });
+    }
+    await Bun.sleep(1500);
+    expect(await screen(session)).not.toContain("too late");
+  }, 15_000);
+
   test("idle says when the agent stops working", async () => {
     const session = await startAgent();
     await host.status({ session, status: "working", reason: "" });
@@ -647,6 +673,16 @@ test("notReady tells a bare prompt from a draft, a menu and a busy screen", () =
   expect(host.notReady("loading", marks)).toBe("it shows no > prompt");
 });
 
+test("markedIn finds the core's mark in ps's line, whatever spaces other values hold", () => {
+  const mark = coreMark();
+  const line = (home: string, value: string) =>
+    `/opt/hc serve HOME=/Users/a b XDG_CONFIG_HOME=${home} SKELCREW_HERDR_CORE=${value} PATH=/bin`;
+  expect(markedIn(line("/Users/a b/state/skelcrew herdr/config", mark), mark)).toBe(true);
+  expect(markedIn(line("/x", `${mark}0`), mark)).toBe(false);
+  expect(markedIn(`/opt/hc serve NOTE=SKELCREW_HERDR_CORE=${mark}`, mark)).toBe(false);
+  expect(markedIn("/opt/hc serve HOME=/Users/a", mark)).toBe(false);
+});
+
 test("notReady reads Skelcrew's Codex and Claude Code marks", () => {
   const codex = { busy: "esc to interrupt", prompt: "› Ask Codex to do anything" };
   expect(host.notReady("› Ask Codex to do anything", codex)).toBe("");
@@ -659,6 +695,19 @@ test("notReady reads Skelcrew's Codex and Claude Code marks", () => {
 });
 
 describe.skipIf(!bin)("Skelcrew's core", () => {
+  test("a config folder whose path holds spaces is Skelcrew's core all the same", async () => {
+    const own = { ...process.env };
+    process.env.SKELCREW_HC_SESSION = `spaces${process.pid}`;
+    process.env.SKELCREW_HERDR_HOME = join(scratch, "with spaces", "skelcrew herdr");
+    try {
+      expect(await host.list()).toEqual({ sessions: [] });
+    } finally {
+      await stopCore().catch(() => {});
+      process.env.SKELCREW_HC_SESSION = own.SKELCREW_HC_SESSION;
+      process.env.SKELCREW_HERDR_HOME = own.SKELCREW_HERDR_HOME;
+    }
+  }, 15_000);
+
   test("a core replaced after a call is checked again, and refused", async () => {
     expect(await host.list()).toHaveProperty("sessions");
     // Another core on the same session, on the person's own config, as any hc command starts one.
