@@ -2,8 +2,7 @@
 // data, so phase 5's runtime plugin can call it from its call handler unchanged. A session is an
 // hc terminal, named by Skelcrew, with labels for its repository, task and role.
 import { closeSync, constants, mkdirSync, openSync, rmSync, statSync, writeSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { z } from "zod";
 import { HcError, hcBin, hcEnv, lines, rpc } from "./hc.ts";
 
@@ -189,24 +188,25 @@ export async function attach(q: z.infer<typeof Attach>) {
 // session ended or went.
 export const Idle = z.object({ session: Session, timeout: z.number().min(0).default(50) });
 export async function idle(q: z.infer<typeof Idle>) {
-  // Checks the core is Skelcrew's, as every call does, before following its events.
-  await rpc("server.status", {});
+  // A first look, which also checks the core is Skelcrew's, as every call does. Only hc saying
+  // the session finished or went counts as ended: a wait that ran out says only what it saw.
+  const first = await live(q.session);
+  if (!first) return { idle: false, status: null, ended: true };
+  // hc's own state word, until it is answered as Skelcrew's.
+  let status = first.status?.state;
+  if (status && status !== "working") return { idle: true, status: wordOf(status) };
   const child = Bun.spawn([hcBin(), "events", "--terminal", q.session, "--json"], {
     env: hcEnv(),
     stdin: "ignore",
     stdout: "pipe",
     stderr: "ignore",
   });
-  // hc's own state word, until it is answered as Skelcrew's.
-  let status: string | undefined;
-  let seen = false;
   const timer = setTimeout(() => child.kill(), q.timeout * 1000);
   try {
     for await (const line of lines(child.stdout)) {
       const message = JSON.parse(line);
       // The first line is the snapshot, then one notification per change.
       if (message.terminals) {
-        seen = true;
         const record = message.terminals[0];
         if (record?.state !== "live") return { idle: false, status: null, ended: true };
         status = record.status?.state;
@@ -217,13 +217,16 @@ export async function idle(q: z.infer<typeof Idle>) {
         return { idle: false, status: wordOf(status), ended: true };
       if (status && status !== "working") return { idle: true, status: wordOf(status) };
     }
-    // No snapshot at all: hc found no such terminal.
-    if (!seen) return { idle: false, status: null, ended: true };
-    return { idle: false, status: wordOf(status) };
   } finally {
     clearTimeout(timer);
     child.kill();
   }
+  // The wait ran out, or hc events stopped: look once more.
+  const last = await live(q.session);
+  if (!last) return { idle: false, status: null, ended: true };
+  status = last.status?.state;
+  if (status && status !== "working") return { idle: true, status: wordOf(status) };
+  return { idle: false, status: wordOf(status) };
 }
 
 // What a harness's screen shows: `busy` while a turn runs, and a line starting with `prompt`
@@ -300,30 +303,31 @@ export async function deliver(q: z.infer<typeof Deliver>) {
     }
     const shown = t.status ?? { state };
     if (state !== "idle" && !(await report(q.session, shown, delivering))) continue;
-    let delivered = false;
-    try {
-      const send = { terminal: q.session, text: q.text, if: "idle" };
-      await rpc("terminal.send", send, left());
-      delivered = true;
-      return { delivered };
-    } catch (error) {
-      if (!(error instanceof HcError)) throw error;
-      // The status changed before typing: look again.
-      if (error.kind === "status_mismatch") continue;
-      // Held by a person's typing until the deadline.
-      if (error.kind === "cancelled")
-        return { delivered: false, why: "a person's typing at its prompt held it" };
-      throw error;
-    } finally {
-      // Putting the status back never hides that the text went in, as the caller would send it
-      // again. An agent that ended after taking it, which leaves nothing to put back, is fine.
-      if (state !== "idle")
-        try {
-          await report(q.session, delivering, shown);
-        } catch (error) {
-          if (!delivered) throw error;
-        }
-    }
+    const send = { terminal: q.session, text: q.text, if: "idle" };
+    const failed = await rpc("terminal.send", send, left()).then(
+      () => null,
+      (error: unknown) => error ?? new Error("the send failed"),
+    );
+    // Then the status goes back, whatever the send did. An agent that ended after taking the
+    // text leaves nothing to put back, and that is no error.
+    const notPutBack =
+      state === "idle"
+        ? null
+        : await report(q.session, delivering, shown).then(
+            () => null,
+            (error: unknown) => error ?? new Error("putting the status back failed"),
+          );
+    // Putting the status back never hides that the text went in, as the caller would send it
+    // again.
+    if (!failed) return { delivered: true };
+    if (!(failed instanceof HcError)) throw failed;
+    if (notPutBack) throw notPutBack;
+    // The status changed before typing: look again.
+    if (failed.kind === "status_mismatch") continue;
+    // Held by a person's typing until the deadline.
+    if (failed.kind === "cancelled")
+      return { delivered: false, why: "a person's typing at its prompt held it" };
+    throw failed;
   }
 }
 
@@ -404,12 +408,22 @@ export function osc7501(shown: Shown): string {
 }
 export const oscFor = (word: Word, reason: string) => osc7501(shownFor(word, reason));
 
+// Where the lock for a session's status lives: named for the core it is on, by the core's own
+// ID, and the session, in a folder of this user's in /tmp. Nothing in a caller's environment
+// changes it, so every caller reaching that terminal takes the same lock.
+export async function lockPath(session: string): Promise<string> {
+  const status = z
+    .object({ core: z.object({ id: z.string().regex(/^[A-Za-z0-9_-]+$/) }) })
+    .parse(await rpc("server.status", {}));
+  const folder = join("/tmp", `skelcrew-herdr-${process.getuid?.() ?? "user"}`);
+  return join(folder, `${status.core.id}-${session}.lock`);
+}
+
 // Runs `fn` holding the session's lock, a folder only one process can make. Every holder is
 // done in moments, so a lock older than 10 seconds was left by a process that died, and goes.
 async function locked<T>(session: string, fn: () => Promise<T>): Promise<T> {
-  const folder = join(tmpdir(), `skelcrew-herdr-${process.getuid?.() ?? "user"}`);
-  mkdirSync(folder, { recursive: true, mode: 0o700 });
-  const lock = join(folder, `${process.env.HC_SESSION || "default"}-${session}.lock`);
+  const lock = await lockPath(session);
+  mkdirSync(dirname(lock), { recursive: true, mode: 0o700 });
   while (true) {
     try {
       mkdirSync(lock);

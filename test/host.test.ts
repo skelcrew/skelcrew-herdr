@@ -507,6 +507,23 @@ describe.skipIf(!bin)("transport on herdr-core", () => {
     expect(await host.idle({ session, timeout: 1 })).toMatchObject({ idle: false, ended: true });
   }, 20_000);
 
+  test("idle with no time to wait says what it sees, and never that a live session ended", async () => {
+    const session = await startAgent();
+    for (let i = 0; i < 3; i++)
+      expect(await host.idle({ session, timeout: 0 })).toEqual({ idle: false, status: null });
+    await host.status({ session, status: "working", reason: "" });
+    for (let i = 0; i < 3; i++)
+      expect(await host.idle({ session, timeout: 0 })).toEqual({ idle: false, status: "working" });
+    await host.status({ session, status: "idle", reason: "" });
+    for (let i = 0; i < 3; i++)
+      expect(await host.idle({ session, timeout: 0 })).toEqual({ idle: true, status: "idle" });
+    expect(await host.idle({ session: "nobody", timeout: 0 })).toEqual({
+      idle: false,
+      status: null,
+      ended: true,
+    });
+  }, 20_000);
+
   test("interrupt presses Esc, and the status stays Skelcrew's to change", async () => {
     const session = await startAgent();
     await host.status({ session, status: "working", reason: "" });
@@ -552,6 +569,34 @@ describe.skipIf(!bin)("the call handler", () => {
       await host.attach({ session: "x" }),
     );
   });
+});
+
+describe.skipIf(!bin)("status reports take turns", () => {
+  test("callers with different environments wait for the same lock", async () => {
+    const session = await startAgent();
+    const lock = await host.lockPath(session);
+    mkdirSync(lock, { recursive: true });
+    // Another caller, as Skelcrew's engine might be, with another inherited HC_SESSION and TMPDIR.
+    const env = { ...process.env, HC_SESSION: "inherited", TMPDIR: join(scratch, "elsewhere") };
+    mkdirSync(env.TMPDIR, { recursive: true });
+    const question = { ask: "status", session, status: "working", reason: "" };
+    const caller = Bun.spawn(["bun", join(import.meta.dir, "..", "src", "call.ts")], {
+      env,
+      stdin: new Blob([JSON.stringify(question)]),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    try {
+      await Bun.sleep(1500);
+      expect(caller.exitCode).toBeNull();
+      expect(await statusOf(session)).toBeNull();
+    } finally {
+      rmSync(lock, { recursive: true, force: true });
+    }
+    expect(await caller.exited).toBe(0);
+    expect(JSON.parse(await new Response(caller.stdout).text())).toEqual({ status: "working" });
+    expect(await statusOf(session)).toBe("working");
+  }, 20_000);
 });
 
 test("oscFor encodes a status the way hc reads it", () => {
