@@ -5,7 +5,7 @@ import { closeSync, constants, mkdirSync, openSync, rmSync, statSync, writeSync 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
-import { ensureCore, HcError, hc, hcBin, hcEnv, lines, rpc } from "./hc.ts";
+import { HcError, hcBin, hcEnv, lines, rpc } from "./hc.ts";
 
 // A session's name, which is its ID: hc's rule for a terminal's name, unique among live ones.
 export const Session = z.string().regex(/^[a-z0-9_-]{1,32}$/, "1-32 of a-z, 0-9, - and _");
@@ -58,7 +58,18 @@ const Terminal = z.object({
 type Terminal = z.infer<typeof Terminal>;
 
 async function get(session: string): Promise<Terminal> {
-  return Terminal.parse(await hc(["get", session]));
+  return Terminal.parse(await rpc("terminal.get", { terminal: session }));
+}
+
+// The session's record while its program runs, or undefined once it ended or went.
+async function live(session: string): Promise<Terminal | undefined> {
+  try {
+    const t = await get(session);
+    return t.state === "live" ? t : undefined;
+  } catch (error) {
+    if (error instanceof HcError && error.kind === "not_found") return undefined;
+    throw error;
+  }
 }
 
 // Starts `argv` in `folder` with exactly `env`, in a new hc terminal named `session`, labelled.
@@ -83,12 +94,14 @@ export async function start(q: z.infer<typeof Start>) {
   const env = Object.entries(q.env).flatMap(([k, v]) => (own.has(k) ? [] : [`${k}=${v}`]));
   const keep = [...own].map((k) => `\${${k}+"${k}=$${k}"}`).join(" ");
   const clean = ["/bin/sh", "-c", `exec /usr/bin/env -i ${keep} "$@"`, "sh", ...env];
-  const labels = Object.entries({ ...q.labels, ...mark }).flatMap(([k, v]) => [
-    "--label",
-    `${k}=${v}`,
-  ]);
-  const run = ["run", "--bg", "--no-parent", "--name", q.session, "--cwd", q.folder, ...labels];
-  const t = Terminal.parse(await hc([...run, "--", ...clean, ...q.argv]));
+  const run = {
+    argv: [...clean, ...q.argv],
+    cwd: q.folder,
+    name: q.session,
+    labels: { ...q.labels, ...mark },
+    no_parent: true,
+  };
+  const t = Terminal.parse(await rpc("terminal.run", run));
   return { session: q.session, address: t.address };
 }
 
@@ -120,14 +133,14 @@ export const Read = z.object({ session: Session, lines: z.number().int().min(0).
 export async function read(q: z.infer<typeof Read>) {
   const answer = z
     .object({ text: z.string() })
-    .parse(await hc(["read", q.session, "--lines", String(q.lines)]));
+    .parse(await rpc("terminal.read", { terminal: q.session, lines: q.lines }));
   return { text: answer.text };
 }
 
 // Presses keys in the session, by hc's names: enter, esc, up, ctrl+c.
 export const Keys = z.object({ session: Session, keys: z.array(z.string().min(1)).min(1) });
 export async function keys(q: z.infer<typeof Keys>) {
-  await hc(["keys", q.session, ...q.keys]);
+  await rpc("terminal.keys", { terminal: q.session, keys: q.keys });
   return {};
 }
 
@@ -140,7 +153,7 @@ export const Interrupt = z.object({ session: Session, timeout: z.number().min(0)
 export async function interrupt(q: z.infer<typeof Interrupt>) {
   const answer = z
     .object({ key: z.string(), outcome: z.string() })
-    .parse(await hc(["interrupt", q.session, "--timeout", String(q.timeout)]));
+    .parse(await rpc("terminal.interrupt", { terminal: q.session, timeout: q.timeout }));
   return answer;
 }
 
@@ -148,21 +161,26 @@ export async function interrupt(q: z.infer<typeof Interrupt>) {
 export const End = z.object({ session: Session });
 export async function end(q: z.infer<typeof End>) {
   try {
-    if ((await get(q.session)).state === "live") await hc(["kill", q.session]);
-    await hc(["rm", q.session]);
+    if ((await get(q.session)).state === "live")
+      await rpc("terminal.kill", { terminal: q.session });
+    await rpc("terminal.rm", { terminal: q.session });
   } catch (error) {
     if (!(error instanceof HcError && error.kind === "not_found")) throw error;
   }
   return {};
 }
 
-// The command that attaches your terminal to the session, for Skelcrew to run in your terminal,
-// with the environment it needs on top of yours to reach Skelcrew's core. Ctrl+\ detaches,
-// hc's key, not Skelcrew's Alt-Q.
+// The command that attaches your terminal to the session, for Skelcrew to run in your terminal
+// as it is: it sets what reaches Skelcrew's core and unsets what would lead elsewhere, whatever
+// your environment holds. Ctrl+\ detaches, hc's key, not Skelcrew's Alt-Q.
 export const Attach = z.object({ session: Session });
-export function attach(q: z.infer<typeof Attach>) {
+export async function attach(q: z.infer<typeof Attach>) {
+  // Checks the core is Skelcrew's, as every call does.
+  await rpc("server.status", {});
   const { HC_SESSION, XDG_CONFIG_HOME } = hcEnv();
-  return { argv: [hcBin(), "attach", q.session], env: { HC_SESSION, XDG_CONFIG_HOME } };
+  const unset = ["HC_SOCKET", "HC_TERMINAL_ID", "HC_SCOPE"].flatMap((k) => ["-u", k]);
+  const set = [`HC_SESSION=${HC_SESSION}`, `XDG_CONFIG_HOME=${XDG_CONFIG_HOME}`];
+  return { argv: ["/usr/bin/env", ...unset, ...set, hcBin(), "attach", q.session] };
 }
 
 // Waits until the agent isn't working, for at most `timeout` seconds, by following hc's events.
@@ -171,7 +189,8 @@ export function attach(q: z.infer<typeof Attach>) {
 // session ended or went.
 export const Idle = z.object({ session: Session, timeout: z.number().min(0).default(50) });
 export async function idle(q: z.infer<typeof Idle>) {
-  await ensureCore();
+  // Checks the core is Skelcrew's, as every call does, before following its events.
+  await rpc("server.status", {});
   const child = Bun.spawn([hcBin(), "events", "--terminal", q.session, "--json"], {
     env: hcEnv(),
     stdin: "ignore",
@@ -281,10 +300,12 @@ export async function deliver(q: z.infer<typeof Deliver>) {
     }
     const shown = t.status ?? { state };
     if (state !== "idle" && !(await report(q.session, shown, delivering))) continue;
+    let delivered = false;
     try {
       const send = { terminal: q.session, text: q.text, if: "idle" };
       await rpc("terminal.send", send, left());
-      return { delivered: true };
+      delivered = true;
+      return { delivered };
     } catch (error) {
       if (!(error instanceof HcError)) throw error;
       // The status changed before typing: look again.
@@ -294,7 +315,14 @@ export async function deliver(q: z.infer<typeof Deliver>) {
         return { delivered: false, why: "a person's typing at its prompt held it" };
       throw error;
     } finally {
-      if (state !== "idle") await report(q.session, delivering, shown);
+      // Putting the status back never hides that the text went in, as the caller would send it
+      // again. An agent that ended after taking it, which leaves nothing to put back, is fine.
+      if (state !== "idle")
+        try {
+          await report(q.session, delivering, shown);
+        } catch (error) {
+          if (!delivered) throw error;
+        }
     }
   }
 }
@@ -332,7 +360,8 @@ function shownFor(word: Word, reason: string): Shown {
 }
 
 // Reports `next` to hc, if it still shows `expected` (any status when null), and returns
-// whether it did. Reports for one session take turns: each waits until hc shows the one before,
+// whether it did. With `expected`, a session that ended or went has nothing to report on, and
+// that is false too; without it, an error. Reports for one session take turns: each waits until hc shows the one before,
 // so a delivery putting a status back can't undo a newer one from Skelcrew.
 //
 // herdr-core reads status only from OSC 7501 in a terminal's output, which is what its program
@@ -341,8 +370,11 @@ function shownFor(word: Word, reason: string): Shown {
 // keeps whole, between two of the program's own writes.
 async function report(session: string, expected: Shown | null, next: Shown): Promise<boolean> {
   return await locked(session, async () => {
-    const t = await get(session);
-    if (t.state !== "live" || !t.pid) throw new Error(`${session} isn't running`);
+    const t = await live(session);
+    if (!t?.pid) {
+      if (expected) return false;
+      throw new Error(`${session} isn't running`);
+    }
     if (expected && !same(t.status, expected)) return false;
     const fd = openSync(ttyOf(t.pid), constants.O_WRONLY | constants.O_NOCTTY);
     try {
@@ -352,7 +384,10 @@ async function report(session: string, expected: Shown | null, next: Shown): Pro
     }
     // hc reads the report as the terminal's output arrives, a moment after the write.
     const deadline = Date.now() + 2000;
-    while (!same((await get(session)).status, next)) {
+    while (true) {
+      const now = await live(session);
+      if (!now && expected) return false;
+      if (same(now?.status, next)) break;
       if (Date.now() > deadline) throw new Error(`hc didn't show ${next.state} for ${session}`);
       await Bun.sleep(20);
     }

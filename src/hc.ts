@@ -68,22 +68,12 @@ const coreKeeps = [
   "HC_STARTED_MS",
 ];
 
-// Starts Skelcrew's core with its config, once per process and session, or finds it running,
-// and checks that it reads that config: a core started some other way, such as by any hc command
-// run on this session, which starts one if none runs, reads the person's config.toml instead.
-const cores = new Map<string, Promise<void>>();
-export function ensureCore(): Promise<void> {
-  const session = hcSession();
-  let ready = cores.get(session);
-  if (!ready) {
-    ready = startCore();
-    cores.set(session, ready);
-    ready.catch(() => cores.delete(session));
-  }
-  return ready;
-}
-
-async function startCore(): Promise<void> {
+// Starts Skelcrew's core with its config if none runs on its session, after writing the config
+// file again if it changed. A core already running is left as it is: every call checks the core
+// it reaches, on its own connection (see rpc), since a core can be stopped and another started
+// on the session at any time, such as by any hc command, which starts one if none runs, on the
+// person's own config.
+export async function ensureCore(): Promise<void> {
   const home = configHome();
   const file = join(home, "herdr-core", "config.toml");
   mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
@@ -95,19 +85,26 @@ async function startCore(): Promise<void> {
   const env = Object.fromEntries(
     coreKeeps.flatMap((k) => (process.env[k] ? [[k, process.env[k]]] : [])),
   );
-  const status = (await run(["server", "start"], 30_000, {
+  await run(["server", "start"], 30_000, {
     ...env,
     HC_SESSION: hcSession(),
     XDG_CONFIG_HOME: home,
-  })) as { pid?: number };
-  const pid = status.pid;
-  const reads = pid ? envOf(pid, "XDG_CONFIG_HOME") : undefined;
-  if (reads !== home)
-    throw new HcError(
-      "config",
-      `the hc core for session ${hcSession()} (pid ${pid}) wasn't started by skelcrew-herdr, so ` +
-        `it could type onto a person's draft. Stop it with HC_SESSION=${hcSession()} hc server stop`,
-    );
+  });
+}
+
+// Stops Skelcrew's core, which ends its agents.
+export async function stopCore(): Promise<void> {
+  await run(["server", "stop"], 30_000, hcEnv());
+}
+
+// Throws unless the core with this pid reads Skelcrew's config.
+function checkCore(pid: number | undefined): void {
+  if (pid && envOf(pid, "XDG_CONFIG_HOME") === configHome()) return;
+  throw new HcError(
+    "config",
+    `the hc core for session ${hcSession()} (pid ${pid}) wasn't started by skelcrew-herdr, so ` +
+      `it could type onto a person's draft. Stop it with HC_SESSION=${hcSession()} hc server stop`,
+  );
 }
 
 // Returns one variable of a process's environment: from /proc on Linux, and from ps on a Mac,
@@ -121,14 +118,9 @@ function envOf(pid: number, key: string): string | undefined {
   return ps.stdout.toString().match(new RegExp(` ${key}=(\\S*)`))?.[1];
 }
 
-// Runs `hc <command> --json <args>` on Skelcrew's core and returns its parsed answer. Throws
-// HcError with hc's kind when hc reports an error, and with kind `timeout` when it runs longer
-// than `timeout` milliseconds, after ending it.
-export async function hc(args: string[], timeout = 30_000): Promise<unknown> {
-  await ensureCore();
-  return run(args, timeout, hcEnv());
-}
-
+// Runs `hc <command> --json <args>` and returns its parsed answer, only for the server commands,
+// which the API doesn't have. Throws HcError with hc's kind when hc reports an error, and with
+// kind `timeout` when it runs longer than `timeout` milliseconds, after ending it.
 async function run(
   args: string[],
   timeout: number,
@@ -172,12 +164,14 @@ function parse(text: string): unknown {
   }
 }
 
-// Calls one API method over `hc connect`, for what the CLI can't do. `hc ls` prints a short form
-// of each terminal, without its labels, where `terminal.list` gives the whole record. And a send
-// can be given up on with `$/cancelRequest`, which hc honours only while the send is still held,
-// before typing: once it typed, the send finishes. So after `cancelAfter` milliseconds this asks
-// to cancel, and the answer says for certain whether the text went in: kind `cancelled` when
-// not. A killed CLI can't tell that apart from a send that typed and then watched for a turn.
+// Calls one API method on Skelcrew's core over `hc connect`, and returns its result. The CLI is
+// one call per command, but a call needs the connection: on it, the core's pid comes first, from
+// `server.status`, and the call goes only once that core proves to read Skelcrew's config. Over
+// the same connection it can only reach that core. And a send can be given up on with
+// `$/cancelRequest`, which hc honours only while the send is still held, before typing: once it
+// typed, the send finishes. So after `cancelAfter` milliseconds this asks to cancel, and the
+// answer says for certain whether the text went in: kind `cancelled` when not. A killed CLI can't
+// tell that apart from a send that typed and then watched for a turn.
 // Cancelling with an answer needs framed mode, so the connection switches to it first: each
 // frame is its channel (u32), kind (u8, 0 for data) and length (u32), little-endian, then the
 // JSON-RPC message, on channel 0.
@@ -212,12 +206,7 @@ export async function rpc(method: string, params: object, cancelAfter?: number):
         reply(JSON.parse(buffer.subarray(0, end).toString()), "hello");
         buffer = buffer.subarray(end + 1);
         framed = true;
-        frame({ id: 1, method, params });
-        if (cancelAfter !== undefined)
-          timer = setTimeout(
-            () => frame({ method: "$/cancelRequest", params: { id: 1 } }),
-            cancelAfter,
-          );
+        frame({ id: 1, method: "server.status", params: {} });
       }
       while (buffer.length >= 9 && buffer.length >= 9 + buffer.readUInt32LE(5)) {
         const [channel, kind, length] = [buffer.readUInt32LE(0), buffer[4], buffer.readUInt32LE(5)];
@@ -225,7 +214,16 @@ export async function rpc(method: string, params: object, cancelAfter?: number):
         buffer = buffer.subarray(9 + length);
         if (channel !== 0 || kind !== 0) continue;
         const message = JSON.parse(payload.toString());
-        if (message.id === 1) return reply(message, method);
+        if (message.id === 1) {
+          checkCore((reply(message, "server.status") as { pid?: number }).pid);
+          frame({ id: 2, method, params });
+          if (cancelAfter !== undefined)
+            timer = setTimeout(
+              () => frame({ method: "$/cancelRequest", params: { id: 2 } }),
+              cancelAfter,
+            );
+        }
+        if (message.id === 2) return reply(message, method);
       }
     }
     const err = await new Response(child.stderr).text();

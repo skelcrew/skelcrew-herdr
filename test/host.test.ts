@@ -6,7 +6,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { answer } from "../src/call.ts";
-import { ensureCore, hc } from "../src/hc.ts";
+import { ensureCore, rpc, stopCore } from "../src/hc.ts";
 import * as host from "../src/host.ts";
 
 const bin = process.env.HC_BIN || Bun.which("hc");
@@ -52,7 +52,7 @@ beforeAll(async () => {
 afterAll(async () => {
   if (!bin) return;
   for (const session of started) await host.end({ session });
-  await hc(["server", "stop"]).catch(() => {});
+  await stopCore().catch(() => {});
   rmSync(scratch, { recursive: true, force: true });
   rmSync(sockets, { recursive: true, force: true });
 });
@@ -100,13 +100,15 @@ const screen = async (session: string) => (await host.read({ session, lines: 0 }
 // Attaches a person's terminal to the session, through `script`, which gives hc attach the
 // terminal it needs, and returns once hc painted the screen, with a way to type and to detach.
 async function attachPerson(session: string) {
+  const { argv: attach } = await host.attach({ session });
+  const quoted = attach.map((word) => `'${word.replaceAll("'", "'\\''")}'`).join(" ");
   const argv =
     process.platform === "darwin"
-      ? ["script", "-q", "/dev/null", bin ?? "hc", "attach", session]
-      : ["script", "-qfc", `${bin} attach ${session}`, "/dev/null"];
+      ? ["script", "-q", "/dev/null", ...attach]
+      : ["script", "-qfc", quoted, "/dev/null"];
   // Bun hands a child the environment it started with unless given process.env as it is now.
   const person = Bun.spawn(argv, {
-    env: { ...process.env, ...host.attach({ session }).env },
+    env: process.env,
     stdin: "pipe",
     stdout: "pipe",
     stderr: "ignore",
@@ -155,17 +157,8 @@ describe.skipIf(!bin)("sessions on herdr-core", () => {
   test("list finds Skelcrew's sessions with their labels, and not others", async () => {
     const lead = await startAgent({ repo: "simon/app", role: "lead" });
     const builder = await startAgent({ repo: "simon/app", role: "builder", task: "app-12" });
-    await hc([
-      "run",
-      "--bg",
-      "--no-parent",
-      "--name",
-      "not-ours",
-      "--label",
-      "repo=x/y",
-      "sleep",
-      "30",
-    ]);
+    const notOurs = { argv: ["sleep", "30"], name: "not-ours", labels: { repo: "x/y" } };
+    await rpc("terminal.run", { ...notOurs, no_parent: true });
     started.push("not-ours");
     const { sessions } = await host.list();
     expect(sessions).toContainEqual({
@@ -216,15 +209,31 @@ describe.skipIf(!bin)("sessions on herdr-core", () => {
     expect<unknown>(found?.ended).toEqual({ reason: "exited", exit_code: 3 });
   }, 15_000);
 
-  test("attach is hc attach on the session", () => {
-    expect(host.attach({ session: "agent-1" })).toEqual({
-      argv: [bin ?? "", "attach", "agent-1"],
-      env: {
-        HC_SESSION: process.env.SKELCREW_HC_SESSION,
-        XDG_CONFIG_HOME: join(scratch, "plugin", "config"),
-      },
+  test("attach is hc attach on the session, on Skelcrew's core whatever the caller's env", async () => {
+    expect(await host.attach({ session: "agent-1" })).toEqual({
+      argv: [
+        "/usr/bin/env",
+        ...["-u", "HC_SOCKET", "-u", "HC_TERMINAL_ID", "-u", "HC_SCOPE"],
+        `HC_SESSION=${process.env.SKELCREW_HC_SESSION}`,
+        `XDG_CONFIG_HOME=${join(scratch, "plugin", "config")}`,
+        bin ?? "",
+        "attach",
+        "agent-1",
+      ],
     });
-  });
+    // A socket override and another session in the caller's env don't lead elsewhere.
+    const session = await startAgent();
+    Object.assign(process.env, { HC_SOCKET: join(sockets, "elsewhere.sock"), HC_SESSION: "x" });
+    try {
+      const person = await attachPerson(session);
+      person.type("typed");
+      await screenShows(session, "> typed");
+      await person.detach();
+    } finally {
+      delete process.env.HC_SOCKET;
+      delete process.env.HC_SESSION;
+    }
+  }, 20_000);
 });
 
 describe.skipIf(!bin)("status on herdr-core", () => {
@@ -240,7 +249,7 @@ describe.skipIf(!bin)("status on herdr-core", () => {
     ] as const;
     for (const [word, reason, osc] of shows) {
       expect(await host.status({ session, status: word, reason })).toEqual({ status: word });
-      const record = (await hc(["get", session])) as { status: unknown };
+      const record = (await rpc("terminal.get", { terminal: session })) as { status: unknown };
       expect(record.status).toEqual(osc);
       const listed = (await host.list()).sessions.find((s) => s.session === session);
       expect(listed?.status).toBe(word);
@@ -466,6 +475,26 @@ describe.skipIf(!bin)("transport on herdr-core", () => {
     }
   }, 20_000);
 
+  test("a delivery to an agent that ends right after taking it is still delivered", async () => {
+    const session = "takes-one";
+    started.push(session);
+    await host.start({
+      session,
+      argv: ["/bin/sh", "-c", 'printf "> "; read line; echo "got: $line"'],
+      folder: scratch,
+      env: {},
+      labels: { repo: "simon/app", role: "builder" },
+    });
+    await screenShows(session, ">");
+    await host.status({ session, status: "ready", reason: "" });
+    expect(await host.deliver({ session, text: "last", marks, timeout: 5 })).toEqual({
+      delivered: true,
+    });
+    const found = (await host.list()).sessions.find((s) => s.session === session);
+    expect(found?.running).toBe(false);
+    expect<unknown>(found?.ended).toEqual({ reason: "exited", exit_code: 0 });
+  }, 15_000);
+
   test("idle says when the agent stops working", async () => {
     const session = await startAgent();
     await host.status({ session, status: "working", reason: "" });
@@ -519,9 +548,9 @@ describe.skipIf(!bin)("the call handler", () => {
   });
 
   test("calls the same functions", async () => {
-    expect(await answer({ ask: "attach", session: "x" })).toMatchObject({
-      argv: [bin ?? "", "attach", "x"],
-    });
+    expect(await answer({ ask: "attach", session: "x" })).toEqual(
+      await host.attach({ session: "x" }),
+    );
   });
 });
 
@@ -549,4 +578,28 @@ test("notReady reads Skelcrew's Codex and Claude Code marks", () => {
   const claude = { busy: "esc to interrupt", prompt: "❯" };
   expect(host.notReady("❯ hi\n⏺ Hello\n❯", claude)).toBe("");
   expect(host.notReady("❯ draft", claude)).toBe(draftReason);
+});
+
+describe.skipIf(!bin)("Skelcrew's core", () => {
+  test("a core replaced after a call is checked again, and refused", async () => {
+    expect(await host.list()).toHaveProperty("sessions");
+    // Another core on the same session, on the person's own config, as any hc command starts one.
+    const env = { ...process.env, HC_SESSION: process.env.SKELCREW_HC_SESSION };
+    await stopCore();
+    Bun.spawnSync([bin ?? "hc", "server", "start", "--json"], { env, stdout: "ignore" });
+    try {
+      await expect(host.list()).rejects.toThrow("wasn't started by skelcrew-herdr");
+      await expect(host.idle({ session: "agent-1", timeout: 1 })).rejects.toThrow(
+        "wasn't started by skelcrew-herdr",
+      );
+      await expect(host.attach({ session: "agent-1" })).rejects.toThrow(
+        "wasn't started by skelcrew-herdr",
+      );
+    } finally {
+      Bun.spawnSync([bin ?? "hc", "server", "stop", "--json"], { env, stdout: "ignore" });
+    }
+    // With it gone, Skelcrew's own starts again.
+    const { sessions } = await host.list();
+    expect(sessions.filter((s) => s.running)).toEqual([]);
+  }, 20_000);
 });
