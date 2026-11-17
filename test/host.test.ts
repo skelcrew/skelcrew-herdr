@@ -2,7 +2,7 @@
 // config and socket folders, so the machine's own core and its terminals are never touched.
 // Without hc on PATH (or HC_BIN), they are skipped, and say so.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { answer } from "../src/call.ts";
@@ -224,6 +224,31 @@ describe.skipIf(!bin)("sessions on herdr-core", () => {
     expect(found?.running).toBe(false);
     expect<unknown>(found?.ended).toEqual({ reason: "exited", exit_code: 3 });
   }, 15_000);
+
+  test("a name stays one session's until end removes it, even after its agent exits", async () => {
+    const session = "reused";
+    started.push(session);
+    const exits = {
+      session,
+      argv: ["/bin/sh", "-c", "exit 0"],
+      folder: scratch,
+      env: {},
+      labels: { repo: "simon/app", role: "builder" as const },
+    };
+    await host.start(exits);
+    for (let i = 0; i < 100; i++, await Bun.sleep(50)) {
+      const found = (await host.list()).sessions.find((s) => s.session === session);
+      if (found && !found.running) break;
+    }
+    await expect(host.start({ ...exits, argv: ["sleep", "30"] })).rejects.toThrow("still kept");
+    const named = (await host.list()).sessions.filter((s) => s.session === session);
+    expect(named).toHaveLength(1);
+    expect(named[0]?.running).toBe(false);
+    await host.end({ session });
+    await host.start({ ...exits, argv: ["sleep", "30"] });
+    const again = (await host.list()).sessions.filter((s) => s.session === session);
+    expect(again.map((s) => s.running)).toEqual([true]);
+  }, 20_000);
 
   test("attach is hc attach on the session, on Skelcrew's core whatever the caller's env", async () => {
     expect(await host.attach({ session: "agent-1" })).toEqual({
@@ -549,6 +574,28 @@ describe.skipIf(!bin)("transport on herdr-core", () => {
     await Bun.sleep(1500);
     expect(await screen(session)).not.toContain("too late");
   }, 15_000);
+
+  test("a send whose setup outlasts its deadline is never sent", async () => {
+    const session = await startAgent();
+    await host.status({ session, status: "idle", reason: "" });
+    // An hc whose core check takes two seconds, as on a slow or busy machine.
+    const slow = join(scratch, "slow-hc");
+    writeFileSync(slow, `#!/bin/sh\n[ "$1" = server ] && sleep 2\nexec '${bin}' "$@"\n`);
+    chmodSync(slow, 0o755);
+    process.env.HC_BIN = slow;
+    try {
+      const send = { terminal: session, text: "LATE", if: "idle" };
+      await expect(rpc("terminal.send", send, Date.now() + 1000)).rejects.toThrow("time ran out");
+      expect(await host.deliver({ session, text: "LATER", marks, timeout: 1 })).toMatchObject({
+        delivered: false,
+      });
+    } finally {
+      process.env.HC_BIN = bin ?? "";
+    }
+    await Bun.sleep(1000);
+    const shown = await screen(session);
+    expect(shown).not.toContain("LATE");
+  }, 30_000);
 
   test("idle says when the agent stops working", async () => {
     const session = await startAgent();

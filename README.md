@@ -17,7 +17,7 @@ echo '{"ask":"list"}' | bun src/call.ts
 | `interrupt` | `session`, `timeout` | `key`, `outcome` | `terminal.interrupt` (`hc interrupt`) |
 | `end` | `session` | | `terminal.kill`, then `terminal.rm` (`hc kill`, `hc rm`) |
 | `attach` | `session` | `argv` for Skelcrew to run in your terminal as it is: `/usr/bin/env -u HC_SOCKET … HC_SESSION=… XDG_CONFIG_HOME=… hc attach <session>` | `hc attach` (Ctrl+\ detaches) |
-| `deliver` | `session`, `text`, the harness's screen `marks` (`busy`, `prompt`), `timeout` | `delivered`, and `why` when not | `hc read`, then `terminal.send` with `if: idle`, never started after the deadline, and cancelled if still held at it |
+| `deliver` | `session`, `text`, the harness's screen `marks` (`busy`, `prompt`), `timeout` | `delivered`, and `why` when not | `hc read`, then `terminal.send` with `if: idle`, never sent after the deadline, even when connecting took the time, and cancelled if still held at it |
 | `idle` | `session`, `timeout` | `idle`, `status`, and `ended` only when hc says the session finished or went | `terminal.get`, then `hc events --terminal` |
 | `status` | `session`, `status`, `reason` | the `status` hc then shows | OSC 7501 written to the session's terminal |
 
@@ -118,6 +118,6 @@ The engine runs as the same user, so it can open the device, and the sandbox nev
    - A per-send option to hold for a draft with no time limit.
    - `if` taking any status word, such as `if: done`.
 6. **Which labels does herdr's app group by?** This prototype uses `repo`, `task` and `role`, plus `by=skelcrew` to find its own. Should Skelcrew prefix them (`skelcrew.repo`), and will herdr's app group by `repo`?
-7. **Session IDs.** The ID here is the hc name Skelcrew gives (a-z, 0-9, `-` and `_`, at most 32), unique among live terminals only. A finished one keeps the name until `end` removes it, and `start` under that name fails until then. Should the ID be hc's address (`t7`) instead, or both?
+7. **Session IDs.** The ID here is the hc name Skelcrew gives (a-z, 0-9, `-` and `_`, at most 32). hc keeps names unique among live terminals only, and lets a new terminal take the name of a finished one it still keeps, which would then answer to the same ID. So `start` refuses a name any kept terminal has, finished ones too, until `end` removes it. Should the ID be hc's address (`t7`) instead, which never changes, or both?
 8. **Which core?** This prototype uses a session of Skelcrew's own, since only a config of its own keeps every draft safe today. herdr's apps then have to look at that session too. Can they show more than one session, or should herdr-core take a draft hold per send (question 5), so Skelcrew can run on the default core?
 9. **Attach.** Should `attach` answer with a command for Skelcrew to run, as here, or run in the terminal itself, as v6's `attach:` manifest entry does?

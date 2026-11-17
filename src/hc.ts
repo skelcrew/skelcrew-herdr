@@ -188,13 +188,16 @@ function parse(text: string): unknown {
 // `server.status`, and the call goes only once that core proves to read Skelcrew's config. Over
 // the same connection it can only reach that core. And a send can be given up on with
 // `$/cancelRequest`, which hc honours only while the send is still held, before typing: once it
-// typed, the send finishes. So after `cancelAfter` milliseconds this asks to cancel, and the
-// answer says for certain whether the text went in: kind `cancelled` when not. A killed CLI can't
-// tell that apart from a send that typed and then watched for a turn.
+// typed, the send finishes. So at `deadline`, a time in milliseconds since the epoch, this asks
+// to cancel, and the answer says for certain whether the text went in: kind `cancelled` when
+// not. A killed CLI can't tell that apart from a send that typed and then watched for a turn.
+// Starting the core, connecting and checking it take time too, so the deadline is looked at
+// again just before the call goes, and a call whose time ran out meanwhile is never sent: kind
+// `late`.
 // Cancelling with an answer needs framed mode, so the connection switches to it first: each
 // frame is its channel (u32), kind (u8, 0 for data) and length (u32), little-endian, then the
 // JSON-RPC message, on channel 0.
-export async function rpc(method: string, params: object, cancelAfter?: number): Promise<unknown> {
+export async function rpc(method: string, params: object, deadline?: number): Promise<unknown> {
   await ensureCore();
   const child = Bun.spawn([hcBin(), "connect"], {
     env: hcEnv(),
@@ -235,11 +238,13 @@ export async function rpc(method: string, params: object, cancelAfter?: number):
         const message = JSON.parse(payload.toString());
         if (message.id === 1) {
           checkCore((reply(message, "server.status") as { pid?: number }).pid);
+          if (deadline !== undefined && Date.now() >= deadline)
+            throw new HcError("late", `${method} wasn't sent: its time ran out`);
           frame({ id: 2, method, params });
-          if (cancelAfter !== undefined)
+          if (deadline !== undefined)
             timer = setTimeout(
               () => frame({ method: "$/cancelRequest", params: { id: 2 } }),
-              cancelAfter,
+              deadline - Date.now(),
             );
         }
         if (message.id === 2) return reply(message, method);

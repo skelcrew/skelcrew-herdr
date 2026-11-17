@@ -90,6 +90,18 @@ export const Start = z.object({
   labels: Labels,
 });
 export async function start(q: z.infer<typeof Start>) {
+  // A name is a session's ID, so it must name one terminal. hc refuses a name a live terminal
+  // has, but lets a new one take the name of one that finished and is still kept, which would
+  // then answer to the same ID. So any kept terminal with the name refuses it too, until `end`
+  // removes it.
+  const kept = z
+    .object({ terminals: z.array(Terminal) })
+    .parse(await rpc("terminal.list", { all: true }));
+  if (kept.terminals.some((t) => t.name === q.session))
+    throw new HcError(
+      "name_taken",
+      `a session named ${q.session} is still kept (end it first, or start under another name)`,
+    );
   const env = Object.entries(q.env).map(([k, v]) => `${k}=${v}`);
   // `--` ends env's options, so a name starting with - is set, not read as an option.
   const clean = ["/usr/bin/env", "-i", "--", ...env];
@@ -343,7 +355,7 @@ export async function deliver(q: z.infer<typeof Deliver>) {
       return late;
     }
     const send = { terminal: q.session, text: q.text, if: "idle" };
-    const failed = await rpc("terminal.send", send, left()).then(
+    const failed = await rpc("terminal.send", send, deadline).then(
       () => null,
       (error: unknown) => error ?? new Error("the send failed"),
     );
@@ -366,6 +378,8 @@ export async function deliver(q: z.infer<typeof Deliver>) {
     // Held by a person's typing until the deadline.
     if (failed.kind === "cancelled")
       return { delivered: false, why: "a person's typing at its prompt held it" };
+    // The time ran out while connecting, so nothing was sent.
+    if (failed.kind === "late") return late;
     throw failed;
   }
 }
