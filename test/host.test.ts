@@ -495,6 +495,33 @@ describe.skipIf(!bin)("transport on herdr-core", () => {
     expect<unknown>(found?.ended).toEqual({ reason: "exited", exit_code: 0 });
   }, 15_000);
 
+  test("a busy mark holds a delivery only while it moves", async () => {
+    const session = await startAgent();
+    await host.status({ session, status: "idle", reason: "" });
+    // The agent quotes the busy mark, which then stands still in its output.
+    expect(
+      await host.deliver({ session, text: "say esc to interrupt", marks, timeout: 5 }),
+    ).toEqual({ delivered: true });
+    await screenShows(session, "got: say esc to interrupt");
+    expect(await host.deliver({ session, text: "quoted", marks, timeout: 5 })).toEqual({
+      delivered: true,
+    });
+    await screenShows(session, "got: quoted");
+    // A busy line that moves, though hc's status says idle.
+    await host.keys({ session, keys: ["ctrl+t"] });
+    await screenShows(session, "working (esc to interrupt)");
+    expect(await host.deliver({ session, text: "moving", marks, timeout: 1.5 })).toEqual({
+      delivered: false,
+      why: "it shows esc to interrupt",
+    });
+    await host.keys({ session, keys: ["ctrl+t"] });
+    expect(await host.deliver({ session, text: "stopped", marks, timeout: 5 })).toEqual({
+      delivered: true,
+    });
+    const shown = await screenShows(session, "got: stopped");
+    expect(shown).not.toContain("got: moving");
+  }, 30_000);
+
   test("idle says when the agent stops working", async () => {
     const session = await startAgent();
     await host.status({ session, status: "working", reason: "" });
@@ -610,7 +637,11 @@ test("notReady tells a bare prompt from a draft, a menu and a busy screen", () =
   expect(host.notReady("got: x\n>", marks)).toBe("");
   expect(host.notReady("> old\ngot: x\n> new", marks)).toBe(draftReason);
   expect(host.notReady("> 1. Yes", marks)).toBe("it shows a menu");
-  expect(host.notReady(">\nesc to interrupt", marks)).toBe("it shows esc to interrupt");
+  // The busy mark counts on a line that moved between two looks, not in output that stands still.
+  expect(host.notReady("got: esc to interrupt\n>", marks)).toBe("");
+  const moving = ["| working (esc to interrupt)\n>", "/ working (esc to interrupt)\n>"];
+  expect(host.notReady(moving[1] ?? "", marks, moving[0])).toBe("it shows esc to interrupt");
+  expect(host.notReady("a\n>", marks, "b\n>")).toBe("its screen kept changing");
   expect(host.notReady("loading", marks)).toBe("it shows no > prompt");
 });
 

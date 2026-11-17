@@ -236,14 +236,27 @@ export const Marks = z.object({ busy: z.string().min(1), prompt: z.string().min(
 export type Marks = z.infer<typeof Marks>;
 
 // Returns why the screen shows the agent not ready for a message, or empty text when its prompt
-// is empty. The prompt's mark is its first word, such as `❯` for Claude Code or `›` for Codex,
+// is empty. `shown` is the screen now, and `before` the same screen a moment earlier.
+//
+// A running turn keeps its status line moving, a spinner or a clock beside the busy mark, so
+// the busy mark counts only on a line that changed between the two looks. The same words in
+// output that stands still, such as an agent quoting them, don't count. A screen that changed
+// elsewhere is still being drawn, and isn't ready either. hc's `if: idle`, not the screen, is
+// what keeps a message out of a running turn: this look is a second guard.
+//
+// The prompt's mark is its first word, such as `❯` for Claude Code or `›` for Codex,
 // and the rest is the placeholder an empty prompt shows, such as Codex's `Ask Codex to do
 // anything`, which typing replaces. So the last line starting with the mark is where a message
 // goes: the mark alone or with its placeholder is empty, and anything else after it is a
 // person's unsent draft. A numbered menu, such as a permission question, also puts the mark
 // before text, and isn't ready either. hc's read drops trailing spaces.
-export function notReady(shown: string, marks: Marks): string {
-  if (shown.includes(marks.busy)) return `it shows ${marks.busy}`;
+export function notReady(shown: string, marks: Marks, before = shown): string {
+  if (before !== shown) {
+    const earlier = before.split("\n");
+    const changed = shown.split("\n").filter((line, i) => line !== earlier[i]);
+    if (changed.some((line) => line.includes(marks.busy))) return `it shows ${marks.busy}`;
+    return "its screen kept changing";
+  }
   const empty = marks.prompt.trim();
   const mark = empty.split(/\s+/)[0] ?? empty;
   const input = shown
@@ -256,6 +269,10 @@ export function notReady(shown: string, marks: Marks): string {
   return draftReason;
 }
 const draftReason = "a person's unsent draft is at its prompt";
+
+// The moment between two looks at the screen: longer than a busy agent's status line stays
+// still, as Skelcrew's built-in transport waits.
+const look = 500;
 
 // Types `text` and Enter into the agent once it isn't working, never into a running turn and
 // never onto a person's unsent draft, waiting at most `timeout` seconds. Answers whether it
@@ -295,7 +312,10 @@ export async function deliver(q: z.infer<typeof Deliver>) {
       if (!waited.idle) return { delivered: false, why: `it was ${waited.status ?? "silent"}` };
       continue;
     }
-    const why = notReady((await read({ session: q.session, lines: 0 })).text, q.marks);
+    // Two looks a moment apart, so a moving status line shows apart from still output.
+    const before = (await read({ session: q.session, lines: 0 })).text;
+    await Bun.sleep(look);
+    const why = notReady((await read({ session: q.session, lines: 0 })).text, q.marks, before);
     if (why) {
       if (left() === 0) return { delivered: false, why };
       await Bun.sleep(Math.min(250, left()));
