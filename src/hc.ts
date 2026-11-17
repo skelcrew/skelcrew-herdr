@@ -10,7 +10,7 @@
 // Nothing outside hc can see a draft the screen doesn't show, so only a hold that never ends
 // keeps every draft safe.
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -39,6 +39,21 @@ export const coreConfig = `# Written by skelcrew-herdr for its own hc core. Chan
 notes = false
 draft_wait = 1000000000
 `;
+
+// The socket Skelcrew's core listens on, found as hc 0.1.21 finds it on Linux and a Mac: in the
+// user's runtime folder (XDG_RUNTIME_DIR, else /run/user/<uid> when it exists), else in the
+// session's state folder, named for the session. The core's config sets no socket, and HC_SOCKET
+// is never passed on, so nothing else moves it.
+export function coreSocket(): string {
+  const session = hcSession().trim();
+  const user = `/run/user/${process.getuid?.()}`;
+  const run =
+    process.env.XDG_RUNTIME_DIR ||
+    (existsSync(user) && statSync(user).isDirectory() ? user : undefined);
+  const state = process.env.XDG_STATE_HOME || join(homedir(), ".local", "state");
+  const folder = run ? join(run, "herdr-core") : join(state, "herdr-core", session);
+  return join(folder, `${session}.sock`);
+}
 
 // The environment for hc, on Skelcrew's session with its config home, which is also where hc
 // reads a socket setting. Inside an hc terminal, hc takes HC_TERMINAL_ID as the caller, so a

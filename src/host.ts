@@ -1,10 +1,19 @@
 // Skelcrew's sessions, transport and status on herdr-core. Each function takes and returns plain
 // data, so phase 5's runtime plugin can call it from its call handler unchanged. A session is an
 // hc terminal, named by Skelcrew, with labels for its repository, task and role.
-import { closeSync, constants, mkdirSync, openSync, rmSync, statSync, writeSync } from "node:fs";
+import {
+  closeSync,
+  constants,
+  existsSync,
+  mkdirSync,
+  openSync,
+  rmSync,
+  statSync,
+  writeSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import { z } from "zod";
-import { HcError, hcBin, hcEnv, lines, rpc } from "./hc.ts";
+import { coreSocket, HcError, hcBin, hcEnv, lines, rpc } from "./hc.ts";
 
 // A session's name, which is its ID: hc's rule for a terminal's name, unique among live ones.
 export const Session = z.string().regex(/^[a-z0-9_-]{1,32}$/, "1-32 of a-z, 0-9, - and _");
@@ -93,7 +102,12 @@ export async function start(q: z.infer<typeof Start>) {
   // A name is a session's ID, so it must name one terminal. hc refuses a name a live terminal
   // has, but lets a new one take the name of one that finished and is still kept, which would
   // then answer to the same ID. So any kept terminal with the name refuses it too, until `end`
-  // removes it.
+  // removes it. The look and the start happen under the session's lock, which every caller on
+  // this core takes, so two starts under one name can't both pass the look.
+  return await locked(q.session, () => startNow(q));
+}
+
+async function startNow(q: z.infer<typeof Start>) {
   const kept = z
     .object({ terminals: z.array(Terminal) })
     .parse(await rpc("terminal.list", { all: true }));
@@ -182,15 +196,22 @@ export async function end(q: z.infer<typeof End>) {
 }
 
 // The command that attaches your terminal to the session, for Skelcrew to run in your terminal
-// as it is: it sets what reaches Skelcrew's core and unsets what would lead elsewhere, whatever
-// your environment holds. Ctrl+\ detaches, hc's key, not Skelcrew's Alt-Q.
+// as it is: it names the core's own socket, and unsets what would make hc take the caller for a
+// terminal of its own, so it reaches Skelcrew's core whatever your environment holds, other
+// runtime and state folders included. Ctrl+\ detaches, hc's key, not Skelcrew's Alt-Q.
 export const Attach = z.object({ session: Session });
 export async function attach(q: z.infer<typeof Attach>) {
   // Checks the core is Skelcrew's, as every call does.
   await rpc("server.status", {});
   const { HC_SESSION, XDG_CONFIG_HOME } = hcEnv();
-  const unset = ["HC_SOCKET", "HC_TERMINAL_ID", "HC_SCOPE"].flatMap((k) => ["-u", k]);
-  const set = [`HC_SESSION=${HC_SESSION}`, `XDG_CONFIG_HOME=${XDG_CONFIG_HOME}`];
+  const socket = coreSocket();
+  if (!existsSync(socket)) throw new Error(`Skelcrew's core has no socket at ${socket}`);
+  const unset = ["HC_TERMINAL_ID", "HC_SCOPE"].flatMap((k) => ["-u", k]);
+  const set = [
+    `HC_SOCKET=${socket}`,
+    `HC_SESSION=${HC_SESSION}`,
+    `XDG_CONFIG_HOME=${XDG_CONFIG_HOME}`,
+  ];
   return { argv: ["/usr/bin/env", ...unset, ...set, hcBin(), "attach", q.session] };
 }
 

@@ -105,7 +105,11 @@ const screen = async (session: string) => (await host.read({ session, lines: 0 }
 
 // Attaches a person's terminal to the session, through `script`, which gives hc attach the
 // terminal it needs, and returns once hc painted the screen, with a way to type and to detach.
-async function attachPerson(session: string) {
+// `env` is the person's terminal's, which can differ from Skelcrew's.
+async function attachPerson(
+  session: string,
+  env: Record<string, string | undefined> = process.env,
+) {
   const { argv: attach } = await host.attach({ session });
   const quoted = attach.map((word) => `'${word.replaceAll("'", "'\\''")}'`).join(" ");
   const argv =
@@ -114,7 +118,7 @@ async function attachPerson(session: string) {
       : ["script", "-qfc", quoted, "/dev/null"];
   // Bun hands a child the environment it started with unless given process.env as it is now.
   const person = Bun.spawn(argv, {
-    env: process.env,
+    env,
     stdin: "pipe",
     stdout: "pipe",
     stderr: "ignore",
@@ -225,6 +229,38 @@ describe.skipIf(!bin)("sessions on herdr-core", () => {
     expect<unknown>(found?.ended).toEqual({ reason: "exited", exit_code: 3 });
   }, 15_000);
 
+  test("starts under one name at once give one session", async () => {
+    const session = "racing";
+    started.push(session);
+    const exits = {
+      session,
+      argv: ["/bin/true"],
+      folder: scratch,
+      env: {},
+      labels: { repo: "simon/app", role: "builder" as const },
+    };
+    // One caller whose every hc call takes two seconds more, so another starts between its look
+    // at the kept names and its own start, and that one's agent has already exited by then.
+    const slow = join(scratch, "slow-start-hc");
+    writeFileSync(slow, `#!/bin/sh\n[ "$1" = server ] && sleep 2\nexec '${bin}' "$@"\n`);
+    chmodSync(slow, 0o755);
+    const first = Bun.spawn(["bun", join(import.meta.dir, "..", "src", "call.ts")], {
+      env: { ...process.env, HC_BIN: slow },
+      stdin: new Blob([JSON.stringify({ ask: "start", ...exits })]),
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    await Bun.sleep(3000);
+    const second = await host.start(exits).then(
+      () => true,
+      () => false,
+    );
+    const firstStarted = (await first.exited) === 0;
+    expect([firstStarted, second].filter(Boolean)).toHaveLength(1);
+    const named = (await host.list()).sessions.filter((s) => s.session === session);
+    expect(named).toHaveLength(1);
+  }, 30_000);
+
   test("a name stays one session's until end removes it, even after its agent exits", async () => {
     const session = "reused";
     started.push(session);
@@ -254,7 +290,8 @@ describe.skipIf(!bin)("sessions on herdr-core", () => {
     expect(await host.attach({ session: "agent-1" })).toEqual({
       argv: [
         "/usr/bin/env",
-        ...["-u", "HC_SOCKET", "-u", "HC_TERMINAL_ID", "-u", "HC_SCOPE"],
+        ...["-u", "HC_TERMINAL_ID", "-u", "HC_SCOPE"],
+        `HC_SOCKET=${join(sockets, "herdr-core", `${process.env.SKELCREW_HC_SESSION}.sock`)}`,
         `HC_SESSION=${process.env.SKELCREW_HC_SESSION}`,
         `XDG_CONFIG_HOME=${join(scratch, "plugin", "config")}`,
         bin ?? "",
@@ -262,17 +299,24 @@ describe.skipIf(!bin)("sessions on herdr-core", () => {
         "agent-1",
       ],
     });
-    // A socket override and another session in the caller's env don't lead elsewhere.
+    // A person's terminal with other runtime and state folders, a socket override and another
+    // session still reaches Skelcrew's core.
     const session = await startAgent();
-    Object.assign(process.env, { HC_SOCKET: join(sockets, "elsewhere.sock"), HC_SESSION: "x" });
+    const elsewhere = join(scratch, "elsewhere");
+    mkdirSync(elsewhere, { recursive: true });
+    const person = await attachPerson(session, {
+      ...process.env,
+      XDG_RUNTIME_DIR: elsewhere,
+      XDG_STATE_HOME: elsewhere,
+      HOME: elsewhere,
+      HC_SOCKET: join(elsewhere, "other.sock"),
+      HC_SESSION: "x",
+    });
     try {
-      const person = await attachPerson(session);
       person.type("typed");
       await screenShows(session, "> typed");
-      await person.detach();
     } finally {
-      delete process.env.HC_SOCKET;
-      delete process.env.HC_SESSION;
+      await person.detach();
     }
   }, 20_000);
 });
