@@ -1,7 +1,18 @@
 // Skelcrew's sessions, transport and status on herdr-core. Each function takes and returns plain
 // data, so phase 5's runtime plugin can call it from its call handler unchanged. A session is an
 // hc terminal, named by Skelcrew, with labels for its repository, task and role.
-import { closeSync, constants, openSync, writeSync } from "node:fs";
+import {
+  closeSync,
+  constants,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeSync,
+} from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { join } from "node:path";
 import { z } from "zod";
 import { HcError, hc, hcBin, hcEnv, lines, rpc } from "./hc.ts";
 
@@ -202,90 +213,210 @@ export async function idle(q: z.infer<typeof Idle>) {
   }
 }
 
+// What a harness's screen shows: `busy` while a turn runs, and a line starting with `prompt`
+// where a message goes, bare when nothing is typed there. The same marks Skelcrew's built-in
+// transport reads.
+export const Marks = z.object({ busy: z.string().min(1), prompt: z.string().min(1) });
+export type Marks = z.infer<typeof Marks>;
+
+// Returns why the screen shows the agent not ready for a message, or empty text when its prompt
+// is bare. Text after the prompt's mark is a person's unsent draft. A numbered menu, such as a
+// permission question, also puts the mark before text, and isn't ready either. hc's read drops
+// trailing spaces, so a bare prompt is the mark alone.
+export function notReady(shown: string, marks: Marks): string {
+  if (shown.includes(marks.busy)) return `it shows ${marks.busy}`;
+  const mark = marks.prompt.trim();
+  const input = shown
+    .split("\n")
+    .map((line) => line.trim())
+    .findLast((line) => line === mark || line.startsWith(`${mark} `));
+  if (input === undefined) return `it shows no ${mark} prompt`;
+  if (input === mark) return "";
+  if (/^\S+ \d+\. /.test(input)) return "it shows a menu";
+  return draftReason;
+}
+const draftReason = "a person's unsent draft is at its prompt";
+
+// How long hc holds a send for a person's draft after their last key: `draft_wait` in hc's
+// config.toml, in seconds, 60 when unset. Read each time, as hc does. The core reads the same
+// file when it runs with the same XDG_CONFIG_HOME and HOME as this process.
+export function draftWait(): number {
+  const home = process.env.XDG_CONFIG_HOME || join(homedir(), ".config");
+  let config = "";
+  try {
+    config = readFileSync(join(home, "herdr-core", "config.toml"), "utf8");
+  } catch {}
+  const set = config.match(/^\s*draft_wait\s*=\s*([-+0-9.eE]+)\s*(#.*)?$/m)?.[1];
+  const seconds = set === undefined ? 60 : Number(set);
+  return Number.isFinite(seconds) ? Math.max(0, seconds) : 60;
+}
+
+// How much sooner than hc's draft hold could end a held send is cancelled: time for a key typed
+// just before the last look to reach the screen, and for the cancel to reach the core.
+const margin = 500;
+
 // Types `text` and Enter into the agent once it isn't working, never into a running turn and
-// never onto a person's unsent draft, waiting at most `timeout` seconds. An idle agent gets it
-// through a send `if` idle, which types only if the status is still idle when the text goes in,
-// and holds it while a person has a draft. An agent that is ready or hit an error gets a plain
-// send, which holds for a draft the same way: `if` knows only idle and working. One that needs
-// you gets it only when no dialog is open, as typing would answer it. A send still held at the
-// deadline is cancelled, which hc honours only before typing, so the answer is certain: whether
-// it went in and, when not, why. After typing, hc watches up to 5 seconds for the agent to start
-// working, so the answer can come that much after the deadline.
+// never onto a person's unsent draft, waiting at most `timeout` seconds. Answers whether it
+// went in and, when not, why: then nothing was typed.
+//
+// Never into a running turn: hc types only through a send `if` idle, which hc checks at the
+// moment it types, whatever happened while the send was held. `if` knows only idle and working,
+// so an agent that is ready, needs you with no dialog open, or hit an error is first reported
+// idle, with the message `delivering`, and its status is put back afterwards unless Skelcrew
+// reported another meanwhile. A report of working while the send is held then stops it.
+//
+// Never onto a draft: hc holds a send while a person has a draft, but only `draft_wait`
+// seconds after their last key, then types on top of it. So a send goes only once the screen
+// shows a bare prompt, by the harness's `marks`, which also catches a draft hc stopped holding.
+// A draft started after that look holds the send in hc for `draft_wait` from its first key, and
+// the send is cancelled before then. hc honours a cancel only before typing, so it is certain.
+// After typing, hc watches up to 5 seconds for the agent to start working, so the answer can
+// come that much after the deadline.
 export const Deliver = z.object({
   session: Session,
   text: z.string().min(1),
+  marks: Marks,
   timeout: z.number().min(0).default(50),
 });
 export async function deliver(q: z.infer<typeof Deliver>) {
   const deadline = Date.now() + q.timeout * 1000;
   const left = () => Math.max(0, deadline - Date.now());
+  const hold = draftWait() * 1000 - margin;
+  if (hold <= 0)
+    return { delivered: false, why: `hc's draft_wait is too short to keep a person's draft safe` };
   while (true) {
     const t = await get(q.session);
     if (t.state !== "live") return { delivered: false, why: "it has ended" };
     const state = t.status?.state;
     if (state === "blocked" && t.status?.kind)
       return { delivered: false, why: `it shows a ${t.status.kind}, which typing would answer` };
-    if (state && state !== "working") {
-      const guard = state === "idle" ? { if: "idle" } : { force: state === "blocked" };
-      try {
-        const send = { terminal: q.session, text: q.text, ...guard };
-        await rpc("terminal.send", send, left());
-        return { delivered: true };
-      } catch (error) {
-        if (!(error instanceof HcError)) throw error;
-        // It started working between the look and the send: wait again.
-        if (error.kind === "status_mismatch") continue;
-        if (error.kind === "cancelled")
-          return { delivered: false, why: "a person's unsent draft held it" };
-        throw error;
-      }
+    if (!state || state === "working") {
+      if (left() === 0) return { delivered: false, why: `it was ${wordOf(state) ?? "silent"}` };
+      const waited = await idle({ session: q.session, timeout: left() / 1000 });
+      if (waited.ended) return { delivered: false, why: "it has ended" };
+      if (!waited.idle) return { delivered: false, why: `it was ${waited.status ?? "silent"}` };
+      continue;
     }
-    if (left() === 0) return { delivered: false, why: `it was ${wordOf(state) ?? "silent"}` };
-    const waited = await idle({ session: q.session, timeout: left() / 1000 });
-    if (waited.ended) return { delivered: false, why: "it has ended" };
-    if (!waited.idle) return { delivered: false, why: `it was ${waited.status ?? "silent"}` };
+    const why = notReady((await read({ session: q.session, lines: 0 })).text, q.marks);
+    if (why) {
+      if (left() === 0) return { delivered: false, why };
+      await Bun.sleep(Math.min(250, left()));
+      continue;
+    }
+    const looked = Date.now();
+    const shown = t.status ?? { state };
+    if (state !== "idle" && !(await report(q.session, shown, delivering))) continue;
+    try {
+      const send = { terminal: q.session, text: q.text, if: "idle" };
+      await rpc("terminal.send", send, Math.min(left(), looked + hold - Date.now()));
+      return { delivered: true };
+    } catch (error) {
+      if (!(error instanceof HcError)) throw error;
+      // The status changed before typing: look again.
+      if (error.kind === "status_mismatch") continue;
+      // Held until the deadline, or so long that hc may soon type onto a draft. Trying again
+      // could find hc's hold over for a draft the screen doesn't show, so this is the answer.
+      if (error.kind === "cancelled")
+        return { delivered: false, why: "a person's typing at its prompt held it" };
+      throw error;
+    } finally {
+      if (state !== "idle") await report(q.session, delivering, shown);
+    }
   }
 }
 
+// The status a delivery reports while it sends to an agent that isn't idle.
+const delivering = { state: "idle", msg: "delivering" };
+
+// One status as hc keeps it: its state, the kind of block, and its message.
+type Shown = { state: string; kind?: string | undefined; msg?: string | undefined };
+const same = (a: Shown | null | undefined, b: Shown) =>
+  a?.state === b.state && (a.kind ?? "") === (b.kind ?? "") && (a.msg ?? "") === (b.msg ?? "");
+
 // Shows a status on herdr: Skelcrew's word for the session, with a short reason, such as
-// `question` or `round limit`. herdr-core reads status only from OSC 7501 in a terminal's
-// output, which is what its program writes to its terminal. So this writes the report to the
-// session's terminal device itself, the one its program has: to hc it is the program speaking.
-// One write, which the terminal driver keeps whole, between two of the program's own writes.
-// Returns the status hc then shows.
+// `question` or `round limit`. Returns the status hc then shows.
 export const Status = z.object({
   session: Session,
   status: Word,
   reason: z.string().default(""),
 });
 export async function status(q: z.infer<typeof Status>) {
-  const t = await get(q.session);
-  if (t.state !== "live" || !t.pid) throw new Error(`${q.session} isn't running`);
-  const tty = ttyOf(t.pid);
-  const fd = openSync(tty, constants.O_WRONLY | constants.O_NOCTTY);
-  try {
-    writeSync(fd, osc7501(q.status, q.reason));
-  } finally {
-    closeSync(fd);
-  }
-  // hc reads the report as the terminal's output arrives, a moment after the write.
-  const deadline = Date.now() + 2000;
-  let shown = t.status?.state;
-  while (shown !== words[q.status] && Date.now() < deadline) {
-    await Bun.sleep(20);
-    shown = (await get(q.session)).status?.state;
-  }
-  return { status: wordOf(shown) };
+  const wanted = shownFor(q.status, q.reason);
+  await report(q.session, null, wanted);
+  return { status: wordOf(wanted.state) };
 }
 
-// The OSC 7501 report for a status word: its state, the kind of block when the reason names
-// one, and the reason as its message, in base64 as the protocol carries text.
-export function osc7501(word: Word, reason: string): string {
-  const fields = [`state=${words[word]}`];
-  if (word === "needs you" && (reason === "question" || reason === "permission"))
-    fields.push(`kind=${reason}`);
-  if (reason) fields.push(`msg=${Buffer.from(reason).toString("base64")}`);
+// The status Skelcrew's word and reason become: the state herdr knows, the kind of block when
+// the reason names one, and the reason as the message.
+function shownFor(word: Word, reason: string): Shown {
+  const kind = word === "needs you" && (reason === "question" || reason === "permission");
+  return {
+    state: words[word],
+    ...(kind ? { kind: reason } : {}),
+    ...(reason ? { msg: reason } : {}),
+  };
+}
+
+// Reports `next` to hc, if it still shows `expected` (any status when null), and returns
+// whether it did. Reports for one session take turns: each waits until hc shows the one before,
+// so a delivery putting a status back can't undo a newer one from Skelcrew.
+//
+// herdr-core reads status only from OSC 7501 in a terminal's output, which is what its program
+// writes to its terminal. So the report is written to the session's terminal device itself, the
+// one its program has: to hc it is the program speaking. One write, which the terminal driver
+// keeps whole, between two of the program's own writes.
+async function report(session: string, expected: Shown | null, next: Shown): Promise<boolean> {
+  return await locked(session, async () => {
+    const t = await get(session);
+    if (t.state !== "live" || !t.pid) throw new Error(`${session} isn't running`);
+    if (expected && !same(t.status, expected)) return false;
+    const fd = openSync(ttyOf(t.pid), constants.O_WRONLY | constants.O_NOCTTY);
+    try {
+      writeSync(fd, osc7501(next));
+    } finally {
+      closeSync(fd);
+    }
+    // hc reads the report as the terminal's output arrives, a moment after the write.
+    const deadline = Date.now() + 2000;
+    while (!same((await get(session)).status, next)) {
+      if (Date.now() > deadline) throw new Error(`hc didn't show ${next.state} for ${session}`);
+      await Bun.sleep(20);
+    }
+    return true;
+  });
+}
+
+// The OSC 7501 report for a status, with its message in base64 as the protocol carries text.
+export function osc7501(shown: Shown): string {
+  const fields = [`state=${shown.state}`];
+  if (shown.kind) fields.push(`kind=${shown.kind}`);
+  if (shown.msg) fields.push(`msg=${Buffer.from(shown.msg).toString("base64")}`);
   return `\x1b]7501;${fields.join(":")}\x1b\\`;
+}
+export const oscFor = (word: Word, reason: string) => osc7501(shownFor(word, reason));
+
+// Runs `fn` holding the session's lock, a folder only one process can make. Every holder is
+// done in moments, so a lock older than 10 seconds was left by a process that died, and goes.
+async function locked<T>(session: string, fn: () => Promise<T>): Promise<T> {
+  const folder = join(tmpdir(), `skelcrew-herdr-${process.getuid?.() ?? "user"}`);
+  mkdirSync(folder, { recursive: true, mode: 0o700 });
+  const lock = join(folder, `${process.env.HC_SESSION || "default"}-${session}.lock`);
+  while (true) {
+    try {
+      mkdirSync(lock);
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      const age = Date.now() - (statSync(lock, { throwIfNoEntry: false })?.mtimeMs ?? Date.now());
+      if (age > 10_000) rmSync(lock, { recursive: true, force: true });
+      else await Bun.sleep(10);
+    }
+  }
+  try {
+    return await fn();
+  } finally {
+    rmSync(lock, { recursive: true, force: true });
+  }
 }
 
 // The terminal device a process has, such as /dev/pts/3 or /dev/ttys003, by asking ps, which

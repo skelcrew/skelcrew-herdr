@@ -14,6 +14,9 @@ const why = "hc (herdr-core) isn't installed: put it on PATH or set HC_BIN";
 if (!bin) console.warn(`skipping the herdr-core tests: ${why}`);
 
 const fakeAgent = join(import.meta.dir, "fake-agent.ts");
+// The fake agent's screen marks, as a harness module gives them.
+const marks = { busy: "esc to interrupt", prompt: ">" };
+const draftReason = "a person's unsent draft is at its prompt";
 let scratch = "";
 // The socket's path is limited to about 100 bytes, so its folder is a short one in /tmp.
 let sockets = "";
@@ -40,7 +43,7 @@ beforeAll(async () => {
   });
   mkdirSync(join(scratch, "config", "herdr-core"), { recursive: true });
   // No notes typed into terminals on hc's own.
-  writeFileSync(join(scratch, "config", "herdr-core", "config.toml"), "notes = false\n");
+  configure("");
   mkdirSync(join(scratch, "work"));
   await hc(["server", "start"]);
 });
@@ -52,6 +55,17 @@ afterAll(async () => {
   rmSync(scratch, { recursive: true, force: true });
   rmSync(sockets, { recursive: true, force: true });
 });
+
+// Writes the core's config.toml, which hc reads again for each delivery. No notes are typed into
+// terminals on hc's own.
+function configure(extra: string) {
+  writeFileSync(join(scratch, "config", "herdr-core", "config.toml"), `notes = false\n${extra}`);
+}
+
+// The status hc shows for the session, in Skelcrew's words.
+async function statusOf(session: string) {
+  return (await host.list()).sessions.find((s) => s.session === session)?.status;
+}
 
 // Starts the fake agent in a session of its own and waits for its prompt.
 async function startAgent(labels: host.Labels = { repo: "simon/app", role: "builder" }) {
@@ -237,11 +251,11 @@ describe.skipIf(!bin)("transport on herdr-core", () => {
   test("deliver types only once the agent is idle", async () => {
     const session = await startAgent();
     await host.status({ session, status: "working", reason: "" });
-    expect(await host.deliver({ session, text: "too soon", timeout: 0.5 })).toEqual({
+    expect(await host.deliver({ session, text: "too soon", marks, timeout: 0.5 })).toEqual({
       delivered: false,
       why: "it was working",
     });
-    const delivery = host.deliver({ session, text: "now", timeout: 10 });
+    const delivery = host.deliver({ session, text: "now", marks, timeout: 10 });
     await Bun.sleep(500);
     expect(await screen(session)).not.toContain("got:");
     await host.status({ session, status: "idle", reason: "" });
@@ -253,16 +267,16 @@ describe.skipIf(!bin)("transport on herdr-core", () => {
   test("deliver goes to a ready agent, but not into an open question", async () => {
     const session = await startAgent();
     await host.status({ session, status: "ready", reason: "" });
-    expect(await host.deliver({ session, text: "review", timeout: 5 })).toEqual({
+    expect(await host.deliver({ session, text: "review", marks, timeout: 5 })).toEqual({
       delivered: true,
     });
     await screenShows(session, "got: review");
     await host.status({ session, status: "needs you", reason: "question" });
-    expect(await host.deliver({ session, text: "yes", timeout: 1 })).toMatchObject({
+    expect(await host.deliver({ session, text: "yes", marks, timeout: 1 })).toMatchObject({
       delivered: false,
     });
     await host.status({ session, status: "needs you", reason: "round limit" });
-    expect(await host.deliver({ session, text: "go on", timeout: 5 })).toEqual({
+    expect(await host.deliver({ session, text: "go on", marks, timeout: 5 })).toEqual({
       delivered: true,
     });
     await screenShows(session, "got: go on");
@@ -276,14 +290,14 @@ describe.skipIf(!bin)("transport on herdr-core", () => {
     try {
       person.type("draft");
       await screenShows(session, "> draft");
-      expect(await host.deliver({ session, text: "held", timeout: 1.5 })).toEqual({
+      expect(await host.deliver({ session, text: "held", marks, timeout: 1.5 })).toEqual({
         delivered: false,
-        why: "a person's unsent draft held it",
+        why: draftReason,
       });
       // The send that timed out is gone: nothing is typed later either.
       await Bun.sleep(1000);
       expect(await screen(session)).not.toContain("held");
-      const delivery = host.deliver({ session, text: "after", timeout: 10 });
+      const delivery = host.deliver({ session, text: "after", marks, timeout: 10 });
       await Bun.sleep(500);
       expect(await screen(session)).not.toContain("after");
       person.type("\x15"); // ctrl+u clears the draft
@@ -294,6 +308,148 @@ describe.skipIf(!bin)("transport on herdr-core", () => {
       await person.detach();
     }
   }, 30_000);
+
+  test("a draft older than hc's draft_wait still holds a delivery", async () => {
+    configure("draft_wait = 1\n");
+    const session = await startAgent();
+    const person = await attachPerson(session);
+    try {
+      // A draft from before the delivery, and one typed while it waits for the agent.
+      await host.status({ session, status: "idle", reason: "" });
+      person.type("draft");
+      await screenShows(session, "> draft");
+      await Bun.sleep(1500);
+      expect(await host.deliver({ session, text: "AUTOMATED", marks, timeout: 2 })).toEqual({
+        delivered: false,
+        why: draftReason,
+      });
+      person.type("\x15");
+      await host.status({ session, status: "working", reason: "" });
+      const delivery = host.deliver({ session, text: "LATER", marks, timeout: 3 });
+      person.type("again");
+      await screenShows(session, "> again");
+      await host.status({ session, status: "idle", reason: "" });
+      expect(await delivery).toEqual({ delivered: false, why: draftReason });
+      await Bun.sleep(500);
+      const shown = await screen(session);
+      expect(shown).not.toContain("AUTOMATED");
+      expect(shown).not.toContain("LATER");
+      person.type("\x15");
+      // With draft_wait at 1, a send has half a second before it is cancelled, less than hc
+      // waits for a screen that just changed to settle. So back to the default.
+      configure("");
+      expect(await host.deliver({ session, text: "cleared", marks, timeout: 5 })).toEqual({
+        delivered: true,
+      });
+      await screenShows(session, "got: cleared");
+    } finally {
+      await person.detach();
+      configure("");
+    }
+  }, 30_000);
+
+  test("a send hc holds for a draft is cancelled before hc's hold runs out", async () => {
+    configure("draft_wait = 2\n");
+    const session = await startAgent();
+    await host.status({ session, status: "idle", reason: "" });
+    const person = await attachPerson(session);
+    try {
+      // A draft the screen doesn't show, typed just before the delivery looks.
+      person.type("\x02draft");
+      await Bun.sleep(100);
+      const started = Date.now();
+      expect(await host.deliver({ session, text: "ONTOP", marks, timeout: 10 })).toEqual({
+        delivered: false,
+        why: "a person's typing at its prompt held it",
+      });
+      expect(Date.now() - started).toBeLessThan(2000);
+      // hc's hold has run out by now, and nothing was typed.
+      await Bun.sleep(1500);
+      expect(await screen(session)).not.toContain("ONTOP");
+      person.type("\x15");
+    } finally {
+      await person.detach();
+      configure("");
+    }
+  }, 20_000);
+
+  test("a draft_wait too short to keep a draft safe delivers nothing", async () => {
+    configure("draft_wait = 0\n");
+    try {
+      const session = await startAgent();
+      await host.status({ session, status: "idle", reason: "" });
+      expect(await host.deliver({ session, text: "x", marks, timeout: 1 })).toMatchObject({
+        delivered: false,
+      });
+    } finally {
+      configure("");
+    }
+  }, 15_000);
+
+  test("a status that changes while hc holds a delivery stops it", async () => {
+    const session = await startAgent();
+    await host.status({ session, status: "ready", reason: "" });
+    const person = await attachPerson(session);
+    try {
+      // A draft the screen doesn't show, so only hc holds the send for it.
+      person.type("\x02draft");
+      await Bun.sleep(300);
+      expect(host.notReady(await screen(session), marks)).toBe("");
+      const delivery = host.deliver({ session, text: "DURING_WORK", marks, timeout: 10 });
+      await Bun.sleep(1000);
+      await host.status({ session, status: "working", reason: "" });
+      person.type("\x15");
+      await Bun.sleep(1500);
+      expect(await screen(session)).not.toContain("DURING_WORK");
+      expect(await statusOf(session)).toBe("working");
+      await host.status({ session, status: "ready", reason: "" });
+      expect(await delivery).toEqual({ delivered: true });
+      await screenShows(session, "got: DURING_WORK");
+    } finally {
+      await person.detach();
+    }
+  }, 30_000);
+
+  test("a status that changes while a draft holds a delivery stops it", async () => {
+    const session = await startAgent();
+    await host.status({ session, status: "ready", reason: "" });
+    const person = await attachPerson(session);
+    try {
+      person.type("draft");
+      await screenShows(session, "> draft");
+      const delivery = host.deliver({ session, text: "DURING_WORK", marks, timeout: 10 });
+      await Bun.sleep(300);
+      await host.status({ session, status: "working", reason: "" });
+      person.type("\x15");
+      await Bun.sleep(1500);
+      expect(await screen(session)).not.toContain("DURING_WORK");
+      await host.status({ session, status: "ready", reason: "" });
+      expect(await delivery).toEqual({ delivered: true });
+      await screenShows(session, "got: DURING_WORK");
+    } finally {
+      await person.detach();
+    }
+  }, 30_000);
+
+  test("a delivery to a ready agent puts its status back", async () => {
+    const session = await startAgent();
+    await host.status({ session, status: "ready", reason: "" });
+    expect(await host.deliver({ session, text: "one", marks, timeout: 5 })).toEqual({
+      delivered: true,
+    });
+    expect(await statusOf(session)).toBe("ready");
+    const person = await attachPerson(session);
+    try {
+      person.type("draft");
+      await screenShows(session, "> draft");
+      expect(await host.deliver({ session, text: "two", marks, timeout: 1 })).toMatchObject({
+        delivered: false,
+      });
+      expect(await statusOf(session)).toBe("ready");
+    } finally {
+      await person.detach();
+    }
+  }, 20_000);
 
   test("idle says when the agent stops working", async () => {
     const session = await startAgent();
@@ -353,9 +509,17 @@ describe.skipIf(!bin)("the call handler", () => {
   });
 });
 
-test("osc7501 encodes a status the way hc reads it", () => {
-  expect(host.osc7501("needs you", "question")).toBe(
+test("oscFor encodes a status the way hc reads it", () => {
+  expect(host.oscFor("needs you", "question")).toBe(
     "\x1b]7501;state=blocked:kind=question:msg=cXVlc3Rpb24=\x1b\\",
   );
-  expect(host.osc7501("ready", "")).toBe("\x1b]7501;state=done\x1b\\");
+  expect(host.oscFor("ready", "")).toBe("\x1b]7501;state=done\x1b\\");
+});
+
+test("notReady tells a bare prompt from a draft, a menu and a busy screen", () => {
+  expect(host.notReady("got: x\n>", marks)).toBe("");
+  expect(host.notReady("> old\ngot: x\n> new", marks)).toBe(draftReason);
+  expect(host.notReady("> 1. Yes", marks)).toBe("it shows a menu");
+  expect(host.notReady(">\nesc to interrupt", marks)).toBe("it shows esc to interrupt");
+  expect(host.notReady("loading", marks)).toBe("it shows no > prompt");
 });
