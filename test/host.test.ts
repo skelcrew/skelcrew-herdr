@@ -76,7 +76,13 @@ async function startAgent(labels: host.Labels = { repo: "simon/app", role: "buil
     session,
     argv: [process.execPath, fakeAgent, "one arg", "two"],
     folder: join(scratch, "work"),
-    env: { PATH: "/usr/bin:/bin", FAKE_TOKEN: "given", TERM: "dumb" },
+    env: {
+      PATH: "/usr/bin:/bin",
+      FAKE_TOKEN: "given",
+      TERM: "dumb",
+      COLORTERM: "custom",
+      TERM_PROGRAM: "custom",
+    },
     labels,
   });
   // hc's read leaves out the space after the prompt's mark.
@@ -143,15 +149,11 @@ describe.skipIf(!bin)("sessions on herdr-core", () => {
     expect(shown).toContain(`argv: ${JSON.stringify(["one arg", "two"])}`);
     expect(shown).toContain(`cwd: ${join(scratch, "work")}`);
     expect(shown).toContain("token: given");
-    // Only what was given, with the terminal's own TERM, COLORTERM and TERM_PROGRAM, never
-    // the core's environment: no HOME, no XDG folders, no HC_ variables.
+    // Exactly what was given, terminal variables too, never the core's environment: no HOME,
+    // no XDG folders, no HC_ variables, and not hc's own TERM.
     const env = JSON.parse(shown.match(/env: (\[.*\])/)?.[1] ?? "[]") as string[];
-    expect(env.filter((key) => !["COLORTERM", "TERM_PROGRAM"].includes(key))).toEqual([
-      "FAKE_TOKEN",
-      "PATH",
-      "TERM",
-    ]);
-    expect(shown).not.toContain("TERM=dumb");
+    expect(env).toEqual(["COLORTERM", "FAKE_TOKEN", "PATH", "TERM", "TERM_PROGRAM"]);
+    expect(shown).toContain(`terminal: ${JSON.stringify(["dumb", "custom", "custom"])}`);
   }, 15_000);
 
   test("list finds Skelcrew's sessions with their labels, and not others", async () => {
@@ -509,8 +511,8 @@ describe.skipIf(!bin)("transport on herdr-core", () => {
     await screenShows(session, "got: quoted");
     // A busy line that moves, though hc's status says idle.
     await host.keys({ session, keys: ["ctrl+t"] });
-    await screenShows(session, "working (esc to interrupt)");
-    expect(await host.deliver({ session, text: "moving", marks, timeout: 1.5 })).toEqual({
+    await screenShows(session, "(esc to interrupt)");
+    expect(await host.deliver({ session, text: "moving", marks, timeout: 4 })).toEqual({
       delivered: false,
       why: "it shows esc to interrupt",
     });
@@ -639,7 +641,7 @@ test("notReady tells a bare prompt from a draft, a menu and a busy screen", () =
   expect(host.notReady("> 1. Yes", marks)).toBe("it shows a menu");
   // The busy mark counts on a line that moved between two looks, not in output that stands still.
   expect(host.notReady("got: esc to interrupt\n>", marks)).toBe("");
-  const moving = ["| working (esc to interrupt)\n>", "/ working (esc to interrupt)\n>"];
+  const moving = ["* working 1s (esc to interrupt)\n>", "* working 2s (esc to interrupt)\n>"];
   expect(host.notReady(moving[1] ?? "", marks, moving[0])).toBe("it shows esc to interrupt");
   expect(host.notReady("a\n>", marks, "b\n>")).toBe("its screen kept changing");
   expect(host.notReady("loading", marks)).toBe("it shows no > prompt");

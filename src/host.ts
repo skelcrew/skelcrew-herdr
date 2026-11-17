@@ -73,9 +73,10 @@ async function live(session: string): Promise<Terminal | undefined> {
 
 // Starts `argv` in `folder` with exactly `env`, in a new hc terminal named `session`, labelled.
 // hc hands every terminal the core's own environment, so a token the core has would reach the
-// agent: `env -i` starts from nothing, as Skelcrew does on tmux. TERM, COLORTERM and
-// TERM_PROGRAM are the terminal's own, which must win: they say what hc draws with. No parent,
-// even when this runs inside an hc terminal, so the agent never ends with the caller.
+// agent: `env -i` starts from nothing and sets exactly what was given, terminal variables such
+// as TERM included: hc's own (xterm-256color, truecolor, ghostty) only when Skelcrew passes
+// them. No parent, even when this runs inside an hc terminal, so the agent never ends with the
+// caller.
 export const Start = z.object({
   session: Session,
   argv: z
@@ -89,10 +90,8 @@ export const Start = z.object({
   labels: Labels,
 });
 export async function start(q: z.infer<typeof Start>) {
-  const own = new Set(["TERM", "COLORTERM", "TERM_PROGRAM"]);
-  const env = Object.entries(q.env).flatMap(([k, v]) => (own.has(k) ? [] : [`${k}=${v}`]));
-  const keep = [...own].map((k) => `\${${k}+"${k}=$${k}"}`).join(" ");
-  const clean = ["/bin/sh", "-c", `exec /usr/bin/env -i ${keep} "$@"`, "sh", ...env];
+  const env = Object.entries(q.env).map(([k, v]) => `${k}=${v}`);
+  const clean = ["/usr/bin/env", "-i", ...env];
   const run = {
     argv: [...clean, ...q.argv],
     cwd: q.folder,
@@ -239,7 +238,7 @@ export type Marks = z.infer<typeof Marks>;
 // is empty. `shown` is the screen now, and `before` the same screen a moment earlier.
 //
 // A running turn keeps its status line moving, a spinner or a clock beside the busy mark, so
-// the busy mark counts only on a line that changed between the two looks. The same words in
+// the busy mark counts only on a line that is new since the earlier look. The same words in
 // output that stands still, such as an agent quoting them, don't count. A screen that changed
 // elsewhere is still being drawn, and isn't ready either. hc's `if: idle`, not the screen, is
 // what keeps a message out of a running turn: this look is a second guard.
@@ -252,10 +251,9 @@ export type Marks = z.infer<typeof Marks>;
 // before text, and isn't ready either. hc's read drops trailing spaces.
 export function notReady(shown: string, marks: Marks, before = shown): string {
   if (before !== shown) {
-    const earlier = before.split("\n");
-    const changed = shown.split("\n").filter((line, i) => line !== earlier[i]);
-    if (changed.some((line) => line.includes(marks.busy))) return `it shows ${marks.busy}`;
-    return "its screen kept changing";
+    const earlier = new Set(before.split("\n"));
+    const live = shown.split("\n").some((line) => line.includes(marks.busy) && !earlier.has(line));
+    return live ? `it shows ${marks.busy}` : "its screen kept changing";
   }
   const empty = marks.prompt.trim();
   const mark = empty.split(/\s+/)[0] ?? empty;
@@ -270,9 +268,25 @@ export function notReady(shown: string, marks: Marks, before = shown): string {
 }
 const draftReason = "a person's unsent draft is at its prompt";
 
-// The moment between two looks at the screen: longer than a busy agent's status line stays
-// still, as Skelcrew's built-in transport waits.
-const look = 500;
+// Returns why the agent's screen shows it not ready, or empty text when it is, as Skelcrew's
+// built-in transport tells: two looks a moment apart, so a moving status line shows apart from
+// still output. A busy mark still at a ready prompt gets one more look, long enough for a status
+// line to redraw: Claude Code's spinner and Codex's "Working" line count seconds, so they redraw
+// at least once a second, and the first two looks can fall between two ticks.
+async function whyNotReady(session: string, marks: Marks): Promise<string> {
+  const look = async () => (await read({ session, lines: 0 })).text;
+  const before = await look();
+  await Bun.sleep(moment);
+  const after = await look();
+  const why = notReady(after, marks, before);
+  if (why || !after.includes(marks.busy)) return why;
+  await Bun.sleep(statusLineWatch);
+  return notReady(await look(), marks, after);
+}
+
+// The moment between the first two looks, and how long a still busy mark is watched after.
+const moment = 500;
+const statusLineWatch = 1500;
 
 // Types `text` and Enter into the agent once it isn't working, never into a running turn and
 // never onto a person's unsent draft, waiting at most `timeout` seconds. Answers whether it
@@ -312,10 +326,7 @@ export async function deliver(q: z.infer<typeof Deliver>) {
       if (!waited.idle) return { delivered: false, why: `it was ${waited.status ?? "silent"}` };
       continue;
     }
-    // Two looks a moment apart, so a moving status line shows apart from still output.
-    const before = (await read({ session: q.session, lines: 0 })).text;
-    await Bun.sleep(look);
-    const why = notReady((await read({ session: q.session, lines: 0 })).text, q.marks, before);
+    const why = await whyNotReady(q.session, q.marks);
     if (why) {
       if (left() === 0) return { delivered: false, why };
       await Bun.sleep(Math.min(250, left()));
