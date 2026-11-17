@@ -1,20 +1,8 @@
 // Skelcrew's sessions, transport and status on herdr-core. Each function takes and returns plain
 // data, so phase 5's runtime plugin can call it from its call handler unchanged. A session is an
 // hc terminal, named by Skelcrew, with labels for its repository, task and role.
-import { randomUUID } from "node:crypto";
-import {
-  closeSync,
-  constants,
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  openSync,
-  readFileSync,
-  renameSync,
-  rmSync,
-  writeFileSync,
-  writeSync,
-} from "node:fs";
+import { dlopen, FFIType } from "bun:ffi";
+import { closeSync, constants, existsSync, mkdirSync, openSync, writeSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { z } from "zod";
 import { coreSocket, HcError, hcBin, hcEnv, lines, rpc } from "./hc.ts";
@@ -486,93 +474,51 @@ export function osc7501(shown: Shown): string {
 }
 export const oscFor = (word: Word, reason: string) => osc7501(shownFor(word, reason));
 
-// Where the lock for a session's status lives: named for the core it is on, by the core's own
-// ID, and the session, in a folder of this user's in /tmp. Nothing in a caller's environment
+// Where the lock for a session lives: a file named for the core it is on, by the core's own ID,
+// and the session, in a folder of this user's in /tmp. Nothing in a caller's environment
 // changes it, so every caller reaching that terminal takes the same lock.
 export async function lockPath(session: string): Promise<string> {
   const status = z
     .object({ core: z.object({ id: z.string().regex(/^[A-Za-z0-9_-]+$/) }) })
     .parse(await rpc("server.status", {}));
   const folder = join("/tmp", `skelcrew-herdr-${process.getuid?.() ?? "user"}`);
-  return join(folder, `${status.core.id}-${session}.lock`);
+  return join(folder, `${status.core.id}-${session}.flock`);
 }
 
-// Runs `fn` holding the session's lock: a folder holding its owner, which only one process can
-// put in place, as a filled folder can't be renamed over another. A holder can take long, as
-// starting the core alone may take 30 seconds, so a lock is never taken for its age: only when
-// its owner has died, which the owner's pid and that process's start time tell, as a pid can
-// be reused. Releasing removes the lock only while it is still this holder's.
-async function locked<T>(session: string, fn: () => Promise<T>): Promise<T> {
+// Runs `fn` holding the session's lock: the system's own lock on its file (flock), which the
+// system lets go of when its holder exits or dies, however long it held it. So nothing ever has
+// to decide that a holder died, or take a lock from one. Two opens of the file exclude each
+// other even in one process. The file stays: removing it while someone waits on it would let
+// two holders in.
+export async function locked<T>(session: string, fn: () => Promise<T>): Promise<T> {
   const lock = await lockPath(session);
   mkdirSync(dirname(lock), { recursive: true, mode: 0o700 });
-  const owner = `${process.pid} ${startOf(process.pid)} ${randomUUID()}`;
-  let looked = 0;
-  while (true) {
-    const ready = mkdtempSync(`${lock}.new-`);
-    writeFileSync(join(ready, "owner"), owner);
-    try {
-      renameSync(ready, lock);
-      break;
-    } catch (error) {
-      rmSync(ready, { recursive: true, force: true });
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code !== "ENOTEMPTY" && code !== "EEXIST") throw error;
-    }
-    // Whether the owner died is asked at most once a second, as it starts ps on a Mac.
-    if (Date.now() - looked > 1000) {
-      looked = Date.now();
-      takeFromTheDead(lock);
-    }
-    await Bun.sleep(10);
-  }
+  const fd = openSync(lock, "a", 0o600);
   try {
+    // Asked without blocking, as a blocking call would stop this process's other work.
+    while (flock()(fd, lockExclusive | lockNoWait) !== 0) await Bun.sleep(10);
     return await fn();
   } finally {
-    if (ownerOf(lock) === owner) rmSync(lock, { recursive: true, force: true });
+    // Closing the file lets go of the lock.
+    closeSync(fd);
   }
 }
 
-// The owner written in a lock, or undefined when there is none.
-function ownerOf(lock: string): string | undefined {
-  try {
-    return readFileSync(join(lock, "owner"), "utf8");
-  } catch {
-    return undefined;
-  }
-}
+// flock's flags, the same on Linux and a Mac.
+const lockExclusive = 2;
+const lockNoWait = 4;
 
-// Removes the lock if its owner has died. It is moved aside first, which only one waiter can
-// do, and removed only if the one moved is still the dead owner's: a lock just taken by a live
-// process is put back.
-function takeFromTheDead(lock: string): void {
-  const owner = ownerOf(lock);
-  if (owner === undefined) return;
-  const [pid, start] = owner.split(" ");
-  if (startOf(Number(pid)) === start) return;
-  const aside = `${lock}.dead-${randomUUID()}`;
-  try {
-    renameSync(lock, aside);
-  } catch {
-    return;
+// The C library's flock, loaded once on first use.
+let flockFn: ((fd: number, operation: number) => number) | undefined;
+function flock(): (fd: number, operation: number) => number {
+  if (!flockFn) {
+    const library = process.platform === "darwin" ? "libSystem.B.dylib" : "libc.so.6";
+    const { symbols } = dlopen(library, {
+      flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
+    });
+    flockFn = (fd, operation) => symbols.flock(fd, operation);
   }
-  if (ownerOf(aside) === owner) rmSync(aside, { recursive: true, force: true });
-  else
-    try {
-      renameSync(aside, lock);
-    } catch {}
-}
-
-// When a process started, as text that tells it apart from a later process given the same pid,
-// or empty text when it isn't running: from /proc on Linux, and from ps elsewhere.
-export function startOf(pid: number): string {
-  if (!Number.isInteger(pid) || pid <= 0) return "";
-  try {
-    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-    // The fields after the command, which is in parentheses and may hold spaces.
-    return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19] ?? "";
-  } catch {}
-  const ps = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(pid)], { stdout: "pipe" });
-  return ps.success ? ps.stdout.toString().trim().replaceAll(" ", "_") : "";
+  return flockFn;
 }
 
 // The terminal device a process has, such as /dev/pts/3 or /dev/ttys003, by asking ps, which

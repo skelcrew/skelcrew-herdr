@@ -2,7 +2,7 @@
 // config and socket folders, so the machine's own core and its terminals are never touched.
 // Without hc on PATH (or HC_BIN), they are skipped, and say so.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { answer } from "../src/call.ts";
@@ -717,12 +717,27 @@ describe.skipIf(!bin)("the call handler", () => {
   });
 });
 
-describe.skipIf(!bin)("status reports take turns", () => {
+// Holds the session's lock in a process of its own, as another caller would, until killed.
+async function holdLockElsewhere(session: string) {
+  const holder = Bun.spawn(["bun", join(import.meta.dir, "hold-lock.ts"), session], {
+    env: process.env,
+    stdout: "pipe",
+    stderr: "ignore",
+  });
+  const reader = holder.stdout.getReader();
+  let said = "";
+  while (!said.includes("held")) {
+    const { value, done } = await reader.read();
+    if (done) throw new Error("the lock holder ended");
+    said += new TextDecoder().decode(value);
+  }
+  return holder;
+}
+
+describe.skipIf(!bin)("a session's lock", () => {
   test("callers with different environments wait for the same lock", async () => {
     const session = await startAgent();
-    const lock = await host.lockPath(session);
-    mkdirSync(lock, { recursive: true });
-    writeFileSync(join(lock, "owner"), `${process.pid} ${host.startOf(process.pid)} test`);
+    const holder = await holdLockElsewhere(session);
     // Another caller, as Skelcrew's engine might be, with another inherited HC_SESSION and TMPDIR.
     const env = { ...process.env, HC_SESSION: "inherited", TMPDIR: join(scratch, "elsewhere") };
     mkdirSync(env.TMPDIR, { recursive: true });
@@ -738,67 +753,68 @@ describe.skipIf(!bin)("status reports take turns", () => {
       expect(caller.exitCode).toBeNull();
       expect(await statusOf(session)).toBeNull();
     } finally {
-      rmSync(lock, { recursive: true, force: true });
+      holder.kill();
     }
     expect(await caller.exited).toBe(0);
     expect(JSON.parse(await new Response(caller.stdout).text())).toEqual({ status: "working" });
     expect(await statusOf(session)).toBe("working");
   }, 20_000);
-});
-
-describe.skipIf(!bin)("a session's lock", () => {
-  // Puts a lock in place for the session as `owner` would hold it, made long ago.
-  async function holdLock(session: string, owner: string) {
-    const lock = await host.lockPath(session);
-    mkdirSync(lock, { recursive: true });
-    writeFileSync(join(lock, "owner"), owner);
-    const old = new Date(Date.now() - 60_000);
-    utimesSync(lock, old, old);
-    return lock;
-  }
-
-  const startQuestion = (session: string) => ({
-    ask: "start",
-    session,
-    argv: ["sleep", "30"],
-    folder: scratch,
-    env: {},
-    labels: { repo: "simon/app", role: "builder" },
-  });
 
   test("stays its live holder's however long it is held", async () => {
     const session = "held-long";
     started.push(session);
-    const lock = await holdLock(session, `${process.pid} ${host.startOf(process.pid)} test`);
+    const holder = await holdLockElsewhere(session);
+    const question = {
+      ask: "start",
+      session,
+      argv: ["sleep", "30"],
+      folder: scratch,
+      env: {},
+      labels: { repo: "simon/app", role: "builder" },
+    };
     const caller = Bun.spawn(["bun", join(import.meta.dir, "..", "src", "call.ts")], {
       env: process.env,
-      stdin: new Blob([JSON.stringify(startQuestion(session))]),
+      stdin: new Blob([JSON.stringify(question)]),
       stdout: "ignore",
       stderr: "ignore",
     });
     try {
-      await Bun.sleep(2500);
+      // Longer than any age a lock could once be taken for.
+      await Bun.sleep(11_000);
       expect(caller.exitCode).toBeNull();
       expect((await host.list()).sessions.map((s) => s.session)).not.toContain(session);
     } finally {
-      rmSync(lock, { recursive: true, force: true });
+      holder.kill();
     }
     expect(await caller.exited).toBe(0);
     expect((await host.list()).sessions.map((s) => s.session)).toContain(session);
-  }, 20_000);
+  }, 30_000);
 
-  test("is taken from a holder that died", async () => {
+  test("goes to one waiter at a time once its holder dies, and is left free", async () => {
     const session = "held-dead";
-    started.push(session);
-    const gone = Bun.spawnSync(["true"]).pid;
-    const lock = await holdLock(session, `${gone} 1 test`);
+    const holder = await holdLockElsewhere(session);
+    let inside = 0;
+    let most = 0;
+    const waiter = () =>
+      host.locked(session, async () => {
+        inside++;
+        most = Math.max(most, inside);
+        await Bun.sleep(100);
+        inside--;
+      });
+    const waiting = Array.from({ length: 4 }, waiter);
     try {
-      const { ask: _, ...q } = startQuestion(session);
-      await host.start({ ...q, labels: { repo: "simon/app", role: "builder" } });
-      expect((await host.list()).sessions.map((s) => s.session)).toContain(session);
+      await Bun.sleep(500);
+      expect(most).toBe(0);
     } finally {
-      rmSync(lock, { recursive: true, force: true });
+      holder.kill("SIGKILL");
     }
+    await Promise.all(waiting);
+    expect(most).toBe(1);
+    // Nothing is left holding it.
+    const started = Date.now();
+    await host.locked(session, async () => {});
+    expect(Date.now() - started).toBeLessThan(1000);
   }, 20_000);
 });
 
