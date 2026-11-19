@@ -16,6 +16,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import { deflateSync } from "node:zlib";
 import { z } from "zod";
 import { answer } from "../src/call.ts";
 import { ensureCore, rpc, stopCore } from "../src/hc.ts";
@@ -1029,6 +1030,46 @@ describe.skipIf(!bin)("a session's lock", () => {
   }, 20_000);
 });
 
+// A small screenshot an image viewer opens: a `width` by `height` PNG, 8-bit RGB, with a
+// gradient, each chunk with its CRC and the pixels deflated as the format requires.
+function validPng(width: number, height: number) {
+  const crcTable = Array.from({ length: 256 }, (_, n) => {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    return c >>> 0;
+  });
+  const crc = (bytes: Uint8Array) => {
+    let c = 0xffffffff;
+    for (const byte of bytes) c = (crcTable[(c ^ byte) & 0xff] ?? 0) ^ (c >>> 8);
+    return (c ^ 0xffffffff) >>> 0;
+  };
+  const chunk = (type: string, data: Uint8Array) => {
+    const out = Buffer.alloc(12 + data.length);
+    out.writeUInt32BE(data.length, 0);
+    out.write(type, 4, "latin1");
+    out.set(data, 8);
+    out.writeUInt32BE(crc(out.subarray(4, 8 + data.length)), 8 + data.length);
+    return out;
+  };
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(width, 0);
+  header.writeUInt32BE(height, 4);
+  header.set([8, 2, 0, 0, 0], 8);
+  // Each row starts with filter type 0, then its pixels' red, green and blue.
+  const rows = Buffer.alloc(height * (1 + width * 3));
+  for (let y = 0; y < height; y++)
+    for (let x = 0; x < width; x++) rows.set([x * 4, y * 5, 128], y * (1 + width * 3) + 1 + x * 3);
+  const signature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  return new Uint8Array(
+    Buffer.concat([
+      signature,
+      chunk("IHDR", header),
+      chunk("IDAT", deflateSync(rows)),
+      chunk("IEND", new Uint8Array()),
+    ]),
+  );
+}
+
 // A small PDF a reader opens, showing `text` on one page: its cross-reference table gives each
 // object's true byte offset, as the format requires.
 function validPdf(text: string) {
@@ -1069,7 +1110,7 @@ describe.skipIf(!bin)("files dropped into a session", () => {
   const marker = () => `/skelcrew-files-${randomBytes(16).toString("hex")}`;
   // A small PDF and PNG, as a person drops them.
   const pdf = validPdf("Dropped into a session");
-  const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
+  const png = validPng(64, 48);
 
   // Starts the fake agent with the marker in its command, as the sandbox's mount would hold it.
   async function startWithFiles(name: string) {
