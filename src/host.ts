@@ -86,33 +86,37 @@ async function live(session: string): Promise<Terminal | undefined> {
 
 // Starts `command` in `folder` with exactly `env`, in a new hc terminal labelled with `labels`,
 // and returns its ID. The command runs under the status relay (see relay.ts), which `status`
-// later reaches by the socket named in the terminal's `relay` label. hc hands every terminal the
-// core's own environment, so a token the core has would reach the agent: `env -i`, inside the
-// relay, starts from nothing and sets exactly what was given, terminal variables such as TERM
+// later reaches by the socket named in the terminal's `relay` label. The environment goes to the
+// relay through hc's own environment for the terminal, never on a command line: any local user
+// can read a command line with ps, and hc shows it in its record, while an environment only its
+// owner reads. hc adds the core's own environment, so a token the core has would reach the
+// agent: the relay hands the agent exactly what was given, terminal variables such as TERM
 // included: hc's own (xterm-256color, truecolor, ghostty) only when Skelcrew passes them. No
 // parent, even when this runs inside an hc terminal, so the agent never ends with the caller.
 // Skelcrew's `name` for the session goes in a label, for a person looking in herdr's apps.
 export const Start = z.object({
   name: z.string().min(1),
-  command: z
-    .array(z.string())
-    .min(1)
-    .refine(([program]) => !program?.includes("=") && !program?.startsWith("-"), {
-      message: "the program's name can't hold = or start with -, as env would misread it",
-    }),
+  command: z.array(z.string()).min(1),
   folder: z.string().min(1),
   env: z.record(z.string().regex(/^[^=\0]+$/), z.string()),
   labels: Labels,
 });
 export async function start(q: z.infer<typeof Start>) {
-  const env = Object.entries(q.env).map(([k, v]) => `${k}=${v}`);
-  // `--` ends env's options, so a name starting with - is set, not read as an option.
-  const clean = ["/usr/bin/env", "-i", "--", ...env];
   const { repository, ...rest } = q.labels;
   const relay = randomBytes(16).toString("hex");
   mkdirSync(relayFolder(), { recursive: true, mode: 0o700 });
+  // Skelcrew runs plugins on the Bun inside its own single file, which acts as Bun only with
+  // BUN_BE_BUN set, so the relay gets it too when it is set here.
+  const bun = process.env.BUN_BE_BUN ? { BUN_BE_BUN: "1" } : {};
   const run = {
-    argv: [...relayCommand(relaySocket(relay)), ...clean, ...q.command],
+    argv: [
+      process.execPath,
+      join(import.meta.dir, "relay.ts"),
+      relaySocket(relay),
+      "--",
+      ...q.command,
+    ],
+    env: { ...bun, SKELCREW_AGENT_ENV: JSON.stringify(q.env) },
     cwd: q.folder,
     labels: { repo: repository, ...rest, name: q.name, relay, ...mark },
     no_parent: true,
@@ -130,14 +134,6 @@ const relayFolder = () => join("/tmp", `skelcrew-herdr-${process.getuid?.() ?? "
 function relaySocket(relay: string): string {
   if (!/^[0-9a-f]{32}$/.test(relay)) throw new Error(`a relay can't be named ${relay}`);
   return join(relayFolder(), `${relay}.sock`);
-}
-
-// The command that runs relay.ts listening on `socket`, with `--` before the agent's own
-// command. It runs on the Bun this program runs on. Skelcrew runs plugins on the Bun inside its
-// own single file, which acts as Bun only with BUN_BE_BUN set, so that is passed on when set.
-function relayCommand(socket: string): string[] {
-  const bun = process.env.BUN_BE_BUN ? ["/usr/bin/env", "BUN_BE_BUN=1"] : [];
-  return [...bun, process.execPath, join(import.meta.dir, "relay.ts"), socket, "--"];
 }
 
 // Lists Skelcrew's sessions on this core, finished ones too, with their labels and whether the

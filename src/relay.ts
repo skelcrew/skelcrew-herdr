@@ -4,15 +4,22 @@
 // untouched, and writes OSC 7501 into that terminal whenever `status` hands it one over its
 // socket. It runs outside the sandbox, as the plugin does.
 //
-// Usage: bun src/relay.ts <socket> -- <command...>
+// Usage: SKELCREW_AGENT_ENV=<json> bun src/relay.ts <socket> -- <command...>
 import { rmSync, writeSync } from "node:fs";
 import { constants } from "node:os";
+import { z } from "zod";
 
 const [socket, dashes, ...command] = process.argv.slice(2);
 if (!socket || dashes !== "--" || command.length === 0) {
   process.stderr.write("usage: relay.ts <socket> -- <command...>\n");
   process.exit(2);
 }
+
+// The agent's whole environment, as JSON. It comes in the relay's own environment, never on its
+// command line, as any local user can read a command line with ps, and it may hold a token.
+const env = z
+  .record(z.string(), z.string())
+  .parse(JSON.parse(process.env.SKELCREW_AGENT_ENV ?? "{}"));
 
 // Each connection carries one report: the OSC 7501 fields, such as `state=idle`, on one line.
 // They are written to the terminal in a single write, which the terminal keeps whole between two
@@ -40,10 +47,11 @@ const server = Bun.listen<{ text: string }>({
 });
 
 // The agent shares this terminal directly, so its keys, resizes and screen pass through
-// untouched, with no terminal in between. It is in the relay's process group, which hc signals
+// untouched, with no terminal in between. It gets exactly its own environment, none of the
+// relay's. It is in the relay's process group, which hc signals
 // as a whole. The sandbox may start a group of its own, so the hangup and terminate that end a
 // terminal are passed on to it too. Ctrl-C, Ctrl-\ and Ctrl-Z are the agent's, never the relay's.
-const child = Bun.spawn(command, { stdio: ["inherit", "inherit", "inherit"] });
+const child = Bun.spawn(command, { env, stdio: ["inherit", "inherit", "inherit"] });
 for (const signal of ["SIGHUP", "SIGTERM"] as const)
   process.on(signal, () => {
     try {

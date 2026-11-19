@@ -45,7 +45,7 @@ echo '{"ask":"list"}' | bun src/call.ts
 
 | `ask` | Takes | Answers | On hc |
 | --- | --- | --- | --- |
-| `start` | `name`, `command`, `folder`, `env`, `labels` (`repository`, `role`, `task`) | `id`, the terminal's hc address, such as `t7` | `terminal.run` (`hc run --bg --no-parent --cwd --label`), under `env -i` |
+| `start` | `name`, `command`, `folder`, `env`, `labels` (`repository`, `role`, `task`) | `id`, the terminal's hc address, such as `t7` | `terminal.run` (`hc run --bg --no-parent --cwd --label`), with the environment handed to the relay |
 | `list` | | `sessions`: each with `id`, `running` and `labels` | `terminal.list` with the `by=skelcrew` label |
 | `read` | `id` | `screen` | `terminal.read` (`hc read`) |
 | `keys` | `id`, `key`: `Enter` or `Escape` | | `terminal.keys` (`hc keys`) |
@@ -118,7 +118,7 @@ Tested with hc 0.1.21.
 **What it doesn't give Skelcrew**
 
 - **Workspaces.** hc has none, by design ("a runtime, not a multiplexer"). Repositories are grouped by the `repo` label, and herdr's app would have to group by it.
-- **An environment of exactly what is given.** Every terminal gets the core's environment, and `terminal.run`'s `env` only adds to it. So `start` runs the command under `/usr/bin/env -i --`, with exactly the variables given (`--` keeps a name starting with `-` from being read as an option), terminal ones included. hc's own `TERM`, `COLORTERM` and `TERM_PROGRAM` (`xterm-256color`, `truecolor`, `ghostty`) reach the agent only when Skelcrew passes them. On tmux, Skelcrew keeps the pane's `TERM` and `TERM_PROGRAM` instead, so on hc it should pass the ones it wants.
+- **An environment of exactly what is given, never on a command line.** Every terminal gets the core's environment, and `terminal.run`'s `env` only adds to it. So `start` puts the agent's whole environment, as JSON, in the relay's `SKELCREW_AGENT_ENV`, and the relay starts the agent with exactly that, terminal variables included. It never goes on a command line, as `ps` shows any command line to every local user, and hc shows it in its record. An environment only its owner can read. hc's own `TERM`, `COLORTERM` and `TERM_PROGRAM` (`xterm-256color`, `truecolor`, `ghostty`) reach the agent only when Skelcrew passes them. On tmux, Skelcrew keeps the pane's `TERM` and `TERM_PROGRAM` instead, so on hc it should pass the ones it wants.
 - **Status of its own.** hc never infers status from the screen. Its status is only what was written to the terminal as OSC 7501. Here that is whatever Skelcrew reports, so hc's idle is Skelcrew's idle passed back: `deliver` and `idle` depend on `status` being called on every change.
 - **A paste without Enter.** `send` is always paste then Enter. That covers `deliver`, but not the `paste` that the v6 sessions table lists for the built-in transport. That transport isn't needed on hc, since hc's own is better, so this plugin has no `paste`.
 - **Skelcrew's detach key.** `hc attach` detaches only with a Ctrl chord, Ctrl+\ by default. Skelcrew's core sets `detach_key = "ctrl+q"`, which tmux sessions also take, but Alt-Q can't work.
