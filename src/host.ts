@@ -6,7 +6,7 @@ import { randomBytes } from "node:crypto";
 import { closeSync, existsSync, mkdirSync, openSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { z } from "zod";
-import { coreSocket, HcError, hcBin, hcEnv, lines, rpc } from "./hc.ts";
+import { coreSocket, ensureCore, HcError, hcBin, hcEnv, lines, rpc } from "./hc.ts";
 
 // A session's ID: its hc address, such as t7, which hc never gives another terminal, even after
 // this one is removed or the core restarts. A name could be taken over by a later terminal once
@@ -93,7 +93,8 @@ async function live(session: string): Promise<Terminal | undefined> {
 // agent: the relay hands the agent exactly what was given, terminal variables such as TERM
 // included: hc's own (xterm-256color, truecolor, ghostty) only when Skelcrew passes them. No
 // parent, even when this runs inside an hc terminal, so the agent never ends with the caller.
-// Skelcrew's `name` for the session goes in a label, for a person looking in herdr's apps.
+// The terminal is named after the session, such as skelcrew-430, so a person finds it in hc ls
+// and herdr's apps; Skelcrew's name goes in a label too, as it is.
 export const Start = z.object({
   name: z.string().min(1),
   command: z.array(z.string()).min(1),
@@ -121,9 +122,24 @@ export async function start(q: z.infer<typeof Start>) {
     labels: { repo: repository, ...rest, name: q.name, relay, ...mark },
     no_parent: true,
   };
-  const t = Terminal.parse(await rpc("terminal.run", run));
-  return { id: t.address };
+  // A name is unique only among live terminals, and a person's own terminal may hold it. Then
+  // the session runs unnamed rather than not at all.
+  const named = hcName(q.name);
+  try {
+    return { id: Terminal.parse(await rpc("terminal.run", { ...run, name: named })).address };
+  } catch (error) {
+    if (!(error instanceof HcError && error.kind === "name_taken")) throw error;
+    return { id: Terminal.parse(await rpc("terminal.run", run)).address };
+  }
 }
+
+// Skelcrew's session name as hc takes a name: 1 to 32 of a-z, 0-9, - and _. A repository's
+// capitals and dots, such as My.App, become my-app.
+const hcName = (name: string) =>
+  name
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]/g, "-")
+    .slice(0, 32);
 
 // The folder of this user's that holds the relays' sockets and the sessions' locks. It is in
 // /tmp, as a socket's path can be only about 100 bytes long.
@@ -199,24 +215,18 @@ export async function end(q: z.infer<typeof End>) {
   return {};
 }
 
-// The command that attaches your terminal to the session: it names the core's own socket, and
-// unsets what would make hc take the caller for a terminal of its own, so it reaches Skelcrew's
-// core whatever your environment holds, other runtime and state folders included. Ctrl-Q
-// detaches, as the core's config sets it.
+// The command that attaches your terminal to the session: it names the default core's socket,
+// and unsets what would make hc take the caller for a terminal of its own or lead it to another
+// core, so it reaches the agents' core whatever your environment holds, other runtime and state
+// folders included. Your hc config's detach key leaves, Ctrl+\ unless you set one.
 export async function attachCommand(id: string): Promise<string[]> {
   Id.parse(id);
-  // Checks the core is Skelcrew's, as every call does.
-  await rpc("server.status", {});
-  const { HC_SESSION, XDG_CONFIG_HOME } = hcEnv();
+  // Starts the core if none runs, as every call does, so its socket is there.
+  await ensureCore();
   const socket = coreSocket();
-  if (!existsSync(socket)) throw new Error(`Skelcrew's core has no socket at ${socket}`);
-  const unset = ["HC_TERMINAL_ID", "HC_SCOPE"].flatMap((k) => ["-u", k]);
-  const set = [
-    `HC_SOCKET=${socket}`,
-    `HC_SESSION=${HC_SESSION}`,
-    `XDG_CONFIG_HOME=${XDG_CONFIG_HOME}`,
-  ];
-  return ["/usr/bin/env", ...unset, ...set, hcBin(), "attach", id];
+  if (!existsSync(socket)) throw new Error(`hc's default core has no socket at ${socket}`);
+  const unset = ["HC_TERMINAL_ID", "HC_SCOPE", "HC_SESSION"].flatMap((k) => ["-u", k]);
+  return ["/usr/bin/env", ...unset, `HC_SOCKET=${socket}`, hcBin(), "attach", id];
 }
 
 // Says whether the agent can take a message now: idle, ready, needs you with no question open,
@@ -239,7 +249,7 @@ function free(shown: Shown | null | undefined): boolean {
 // events. Says whether it got there, the state hc last showed, and `ended` when the session
 // ended or went. Only hc saying so counts as ended: a wait that ran out says only what it saw.
 async function waitUntilIdle(id: string, timeout: number) {
-  // A first look, which also checks the core is Skelcrew's, as every call does.
+  // A first look, as the session may already be idle or gone.
   const first = await live(id);
   if (!first) return { idle: false, state: undefined, ended: true };
   let state = first.status?.state;
@@ -349,7 +359,7 @@ const statusLineWatch = 1500;
 // reported another meanwhile. A report of working while the send is held then stops it.
 //
 // Never onto a draft: hc holds a send while a person has a draft, the screen shows it or not,
-// and on Skelcrew's core that hold has no end (see hc.ts). Given the harness's `marks`, a send
+// for as long as the person's hc config says, `draft_wait`, 60 seconds unless set. Given the harness's `marks`, a send
 // also goes only once the screen shows an empty prompt, which catches a draft hc never saw, such
 // as one typed before the core restarted. A send still held at the deadline is cancelled, which
 // hc honours only before typing, so the answer is certain. After typing, hc watches up to 5

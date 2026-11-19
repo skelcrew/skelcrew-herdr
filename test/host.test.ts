@@ -5,8 +5,9 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { z } from "zod";
 import { answer } from "../src/call.ts";
-import { coreMark, ensureCore, markedIn, rpc, stopCore } from "../src/hc.ts";
+import { ensureCore, rpc, stopCore } from "../src/hc.ts";
 import * as host from "../src/host.ts";
 
 const bin = process.env.HC_BIN || Bun.which("hc");
@@ -26,15 +27,13 @@ beforeAll(async () => {
   if (!bin) return;
   scratch = mkdtempSync(join(tmpdir(), "skelcrew-herdr-"));
   sockets = mkdtempSync("/tmp/hc-");
-  for (const key of ["HC_SOCKET", "HC_TERMINAL_ID", "HC_TERMINAL_SOCKET", "HC_SCOPE"])
+  for (const key of ["HC_SOCKET", "HC_SESSION", "HC_TERMINAL_ID", "HC_TERMINAL_SOCKET", "HC_SCOPE"])
     delete process.env[key];
   Object.assign(process.env, {
     HC_BIN: bin,
-    // Skelcrew's core for these tests, and this program's files, with its config.
-    SKELCREW_HC_SESSION: `test${process.pid}`,
-    SKELCREW_HERDR_HOME: join(scratch, "plugin"),
+    // The tests' own default core: its runtime folder holds its socket, so the machine's own
+    // core and its terminals are never touched. A person's hc config, which the core reads.
     XDG_STATE_HOME: join(scratch, "state"),
-    // A person's own hc config, which Skelcrew's core never reads.
     XDG_CONFIG_HOME: join(scratch, "config"),
     XDG_RUNTIME_DIR: sockets,
     // A person's key holds an agent's send this long, 3s by default.
@@ -44,6 +43,7 @@ beforeAll(async () => {
     HC_STARTED_MS: "300",
   });
   mkdirSync(join(scratch, "config", "herdr-core"), { recursive: true });
+  personConfig(recommended);
   mkdirSync(join(scratch, "work"));
   await ensureCore();
 });
@@ -56,8 +56,10 @@ afterAll(async () => {
   rmSync(sockets, { recursive: true, force: true });
 });
 
-// Writes a person's own hc config.toml, which a core started on it would read, and hc reads
-// again for each delivery.
+// The hc config the README asks a person to set, which the core reads.
+const recommended = 'notes = false\ndraft_wait = 1000000000\ndetach_key = "ctrl+q"\n';
+
+// Writes a person's own hc config.toml, which the core reads, again for each delivery.
 function personConfig(text: string) {
   writeFileSync(join(scratch, "config", "herdr-core", "config.toml"), text);
 }
@@ -186,6 +188,25 @@ describe.skipIf(!bin)("sessions on herdr-core", () => {
     expect(JSON.stringify(await rpc("terminal.get", { terminal: session }))).not.toContain(token);
   }, 15_000);
 
+  test("a started session is a terminal a person's own hc lists, under its name", async () => {
+    const session = await startSession({
+      name: "skelcrew-430",
+      command: ["sleep", "30"],
+      folder: scratch,
+      env: {},
+      labels: { repository: "simon/skelcrew", role: "builder", task: "skelcrew-430" },
+    });
+    // A person's hc, as they type it, with no session chosen: the core herdr's apps show.
+    const { HC_SESSION: _, ...env } = process.env;
+    const ls = Bun.spawnSync([bin ?? "hc", "ls", "--json"], { env });
+    const listed = z
+      .object({
+        terminals: z.array(z.object({ address: z.string(), name: z.string().nullable() })),
+      })
+      .parse(JSON.parse(ls.stdout.toString())).terminals;
+    expect(listed).toContainEqual({ address: session, name: "skelcrew-430" });
+  }, 15_000);
+
   test("start sets an environment name that starts with -, rather than reading it as an option", async () => {
     const session = await startSession({
       name: "dash-env",
@@ -296,19 +317,17 @@ describe.skipIf(!bin)("sessions on herdr-core", () => {
     }
   }, 20_000);
 
-  test("attach is hc attach on the session, on Skelcrew's core whatever the caller's env", async () => {
+  test("attach is hc attach on the session, on the default core whatever the caller's env", async () => {
     expect(await host.attachCommand("t1")).toEqual([
       "/usr/bin/env",
-      ...["-u", "HC_TERMINAL_ID", "-u", "HC_SCOPE"],
-      `HC_SOCKET=${join(sockets, "herdr-core", `${process.env.SKELCREW_HC_SESSION}.sock`)}`,
-      `HC_SESSION=${process.env.SKELCREW_HC_SESSION}`,
-      `XDG_CONFIG_HOME=${join(scratch, "plugin", "config")}`,
+      ...["-u", "HC_TERMINAL_ID", "-u", "HC_SCOPE", "-u", "HC_SESSION"],
+      `HC_SOCKET=${join(sockets, "herdr-core", "default.sock")}`,
       bin ?? "",
       "attach",
       "t1",
     ]);
     // A person's terminal with other runtime and state folders, a socket override and another
-    // session still reaches Skelcrew's core.
+    // session still reaches the agents' core.
     const session = await startAgent();
     const elsewhere = join(scratch, "elsewhere");
     mkdirSync(elsewhere, { recursive: true });
@@ -475,26 +494,16 @@ describe.skipIf(!bin)("transport on herdr-core", () => {
     const session = await startAgent();
     await host.status({ id: session, status: "idle", reason: "" });
     const person = await attachPerson(session);
-    // A person's own config can't shorten the hold on Skelcrew's core, however it is written.
-    const configs = [
-      ["draft_wait = 2\n", 3000],
-      ['"draft_wait" = 0\n', 500],
-      ["'draft_wait' = 0.0 # off\n", 500],
-      ["[x]\n", 500],
-    ] as const;
     try {
-      for (const [config, age] of configs) {
-        personConfig(config);
-        person.type("\x02draft");
-        await Bun.sleep(age);
-        expect(host.notReady(await screen(session), marks)).toBe("");
-        await expect(
-          host.deliver({ id: session, text: "ONTOP", marks, timeout: 1500 }),
-        ).rejects.toThrow("a person's typing at its prompt held it");
-        await Bun.sleep(500);
-        expect(await screen(session)).not.toContain("ONTOP");
-        person.type("\x15");
-      }
+      person.type("\x02draft");
+      await Bun.sleep(3000);
+      expect(host.notReady(await screen(session), marks)).toBe("");
+      await expect(
+        host.deliver({ id: session, text: "ONTOP", marks, timeout: 1500 }),
+      ).rejects.toThrow("a person's typing at its prompt held it");
+      await Bun.sleep(500);
+      expect(await screen(session)).not.toContain("ONTOP");
+      person.type("\x15");
       expect(await host.deliver({ id: session, text: "cleared", marks, timeout: 5000 })).toEqual(
         {},
       );
@@ -502,24 +511,8 @@ describe.skipIf(!bin)("transport on herdr-core", () => {
       expect(shown).not.toContain("draftONTOP");
     } finally {
       await person.detach();
-      personConfig("");
     }
   }, 40_000);
-
-  test("a core for the session started without this program's config is refused", async () => {
-    const own = process.env.SKELCREW_HC_SESSION;
-    const other = `other${process.pid}`;
-    // Started as any hc command would start it, on the person's own config.
-    const env = { ...process.env, HC_SESSION: other };
-    Bun.spawnSync([bin ?? "hc", "server", "start", "--json"], { env, stdout: "ignore" });
-    process.env.SKELCREW_HC_SESSION = other;
-    try {
-      await expect(host.list()).rejects.toThrow("wasn't started by skelcrew-herdr");
-    } finally {
-      process.env.SKELCREW_HC_SESSION = own;
-      Bun.spawnSync([bin ?? "hc", "server", "stop", "--json"], { env, stdout: "ignore" });
-    }
-  }, 15_000);
 
   test("a status that changes while hc holds a delivery stops it", async () => {
     const session = await startAgent();
@@ -636,7 +629,7 @@ describe.skipIf(!bin)("transport on herdr-core", () => {
   test("a send whose setup outlasts its deadline is never sent", async () => {
     const session = await startAgent();
     await host.status({ id: session, status: "idle", reason: "" });
-    // An hc whose core check takes two seconds, as on a slow or busy machine.
+    // An hc whose core start takes two seconds, as on a slow or busy machine.
     const slow = join(scratch, "slow-hc");
     writeFileSync(slow, `#!/bin/sh\n[ "$1" = server ] && sleep 2\nexec '${bin}' "$@"\n`);
     chmodSync(slow, 0o755);
@@ -849,16 +842,6 @@ test("notReady tells a bare prompt from a draft, a menu and a busy screen", () =
   expect(host.notReady("loading", marks)).toBe("it shows no > prompt");
 });
 
-test("markedIn finds the core's mark in ps's line, whatever spaces other values hold", () => {
-  const mark = coreMark();
-  const line = (home: string, value: string) =>
-    `/opt/hc serve HOME=/Users/a b XDG_CONFIG_HOME=${home} SKELCREW_HERDR_CORE=${value} PATH=/bin`;
-  expect(markedIn(line("/Users/a b/state/skelcrew herdr/config", mark), mark)).toBe(true);
-  expect(markedIn(line("/x", `${mark}0`), mark)).toBe(false);
-  expect(markedIn(`/opt/hc serve NOTE=SKELCREW_HERDR_CORE=${mark}`, mark)).toBe(false);
-  expect(markedIn("/opt/hc serve HOME=/Users/a", mark)).toBe(false);
-});
-
 test("notReady reads Skelcrew's Codex and Claude Code marks", () => {
   const codex = { busy: "esc to interrupt", prompt: "› Ask Codex to do anything" };
   expect(host.notReady("› Ask Codex to do anything", codex)).toBe("");
@@ -868,37 +851,4 @@ test("notReady reads Skelcrew's Codex and Claude Code marks", () => {
   const claude = { busy: "esc to interrupt", prompt: "❯" };
   expect(host.notReady("❯ hi\n⏺ Hello\n❯", claude)).toBe("");
   expect(host.notReady("❯ draft", claude)).toBe(draftReason);
-});
-
-describe.skipIf(!bin)("Skelcrew's core", () => {
-  test("a config folder whose path holds spaces is Skelcrew's core all the same", async () => {
-    const own = { ...process.env };
-    process.env.SKELCREW_HC_SESSION = `spaces${process.pid}`;
-    process.env.SKELCREW_HERDR_HOME = join(scratch, "with spaces", "skelcrew herdr");
-    try {
-      expect(await host.list()).toEqual({ sessions: [] });
-    } finally {
-      await stopCore().catch(() => {});
-      process.env.SKELCREW_HC_SESSION = own.SKELCREW_HC_SESSION;
-      process.env.SKELCREW_HERDR_HOME = own.SKELCREW_HERDR_HOME;
-    }
-  }, 15_000);
-
-  test("a core replaced after a call is checked again, and refused", async () => {
-    expect(await host.list()).toHaveProperty("sessions");
-    // Another core on the same session, on the person's own config, as any hc command starts one.
-    const env = { ...process.env, HC_SESSION: process.env.SKELCREW_HC_SESSION };
-    await stopCore();
-    Bun.spawnSync([bin ?? "hc", "server", "start", "--json"], { env, stdout: "ignore" });
-    try {
-      await expect(host.list()).rejects.toThrow("wasn't started by skelcrew-herdr");
-      await expect(host.idle({ id: "t1" })).rejects.toThrow("wasn't started by skelcrew-herdr");
-      await expect(host.attachCommand("t1")).rejects.toThrow("wasn't started by skelcrew-herdr");
-    } finally {
-      Bun.spawnSync([bin ?? "hc", "server", "stop", "--json"], { env, stdout: "ignore" });
-    }
-    // With it gone, Skelcrew's own starts again.
-    const { sessions } = await host.list();
-    expect(sessions.filter((s) => s.running)).toEqual([]);
-  }, 20_000);
 });
