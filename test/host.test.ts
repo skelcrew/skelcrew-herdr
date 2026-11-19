@@ -348,6 +348,74 @@ describe.skipIf(!bin)("sessions on herdr-core", () => {
   }, 20_000);
 });
 
+describe.skipIf(!bin)("workspaces in herdr's app", () => {
+  // The app's layout, the hc document it keeps its workspaces in.
+  const Layout = z.object({
+    spaces: z.array(
+      z.object({
+        id: z.string(),
+        name: z.string(),
+        tabs: z.array(
+          z.object({
+            id: z.string(),
+            name: z.string(),
+            root: z.object({
+              children: z.array(z.object({ content: z.object({ terminal: z.string() }) })),
+            }),
+          }),
+        ),
+      }),
+    ),
+  });
+  const layout = async () =>
+    Layout.parse(
+      z.object({ value: z.unknown() }).parse(await rpc("doc.get", { name: "herdr-app" })).value ?? {
+        spaces: [],
+      },
+    );
+  const placed = { repository: "simon/placed" };
+  const start = (name: string, labels: host.Labels) =>
+    startSession({ name, command: ["sleep", "30"], folder: scratch, env: {}, labels });
+
+  test("each session gets a tab in its repository's workspace, the lead's first", async () => {
+    // A workspace of the person's own, with what a later app may add, which stays as it is.
+    const { version } = z
+      .object({ version: z.number() })
+      .parse(await rpc("doc.get", { name: "herdr-app" }));
+    const own = { id: "spown", name: "", folder: "/home/a", tabs: [], color: "blue" };
+    const kept = { spaces: [...(await layout()).spaces, own], theme: "dark" };
+    await rpc("doc.set", { name: "herdr-app", value: kept, version });
+    const builder = await start("placed-1", { ...placed, role: "builder", task: "placed-1" });
+    const lead = await start("lead-placed", { ...placed, role: "lead" });
+    const after = await layout();
+    const whole = z
+      .object({ value: z.object({ theme: z.string(), spaces: z.array(z.unknown()) }) })
+      .parse(await rpc("doc.get", { name: "herdr-app" }));
+    expect(whole.value.theme).toBe("dark");
+    expect(whole.value.spaces).toContainEqual(own);
+    const space = after.spaces.find((s) => s.name === "simon/placed");
+    expect(
+      space?.tabs.map((t) => [t.name, t.root.children.map((c) => c.content.terminal)]),
+    ).toEqual([
+      ["lead", [lead]],
+      ["placed-1", [builder]],
+    ]);
+    // hc ls says where each one is, as for a terminal the app placed itself.
+    const ls = Bun.spawnSync([bin ?? "hc", "ls", "--json"], { env: process.env });
+    const listed = z
+      .object({
+        terminals: z.array(z.object({ address: z.string(), where: z.string().optional() })),
+      })
+      .parse(JSON.parse(ls.stdout.toString())).terminals;
+    expect(listed).toContainEqual({ address: builder, where: "simon/placed / placed-1" });
+    expect(listed).toContainEqual({ address: lead, where: "simon/placed / lead" });
+    // Ending a session closes its tab.
+    await host.end({ id: builder });
+    const ended = (await layout()).spaces.find((s) => s.name === "simon/placed");
+    expect(ended?.tabs.map((t) => t.name)).toEqual(["lead"]);
+  }, 20_000);
+});
+
 describe.skipIf(!bin)("sessions an older version started", () => {
   // Version 0.1.0 ran its agents on a core of its own, the hc session `skelcrew`. This starts
   // a terminal there as 0.1.0 labelled it, running `sleep`, and returns its address and pid.

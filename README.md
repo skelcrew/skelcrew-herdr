@@ -34,6 +34,8 @@ hc ls --label by=skelcrew
 hc ls --label repo=simon/app
 ```
 
+**Workspaces in herdr's app.** Each repository gets a workspace named after it, such as `skelcrew/skelcrew`, with a tab per session: `lead` first, then each builder under its thread's name, such as `skelcrew-430`. A restarted agent takes over its thread's tab, and ending a session closes its tab, and its workspace once that is empty. The app keeps its workspaces in the hc document `herdr-app`. The plugin writes that document only if nobody wrote it since it was read, so nothing you change in the app is lost. Each terminal also gets the app's labels, `herdr.space`, `herdr.tab` and `where`, so `hc ls` says where it is. Leads still run on tmux, and reviewers run headless, so neither has a tab yet.
+
 herdr shows each agent as its harness, `claude` or `codex`, from the `app` the relay puts in every status report. Until Skelcrew's first report, it shows the relay's own program.
 
 A name is unique only among live terminals. If one of yours already has it, the agent's terminal runs unnamed, and its `name` label still says which session it is.

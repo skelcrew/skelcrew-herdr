@@ -17,6 +17,7 @@ import {
   lines,
   rpc,
 } from "./hc.ts";
+import { place, unplace } from "./workspaces.ts";
 
 // A session's ID: its hc address, such as t7, which hc never gives another terminal, even after
 // this one is removed or the core restarts. A name could be taken over by a later terminal once
@@ -159,12 +160,19 @@ export async function start(q: z.infer<typeof Start>) {
   // A name is unique only among live terminals, and a person's own terminal may hold it. Then
   // the session runs unnamed rather than not at all.
   const named = hcName(q.name);
+  let id: string;
   try {
-    return { id: Terminal.parse(await rpc("terminal.run", { ...run, name: named })).address };
+    id = Terminal.parse(await rpc("terminal.run", { ...run, name: named })).address;
   } catch (error) {
     if (!(error instanceof HcError && error.kind === "name_taken")) throw error;
-    return { id: Terminal.parse(await rpc("terminal.run", run)).address };
+    id = Terminal.parse(await rpc("terminal.run", run)).address;
   }
+  // A tab in herdr's app. The agent already runs, so a tab that fails is only said on stderr:
+  // an error would tell Skelcrew it never started, and it would start a second one.
+  await place(id, q.labels, q.name).catch((error: unknown) =>
+    process.stderr.write(`${id} has no tab in herdr's app: ${String(error)}\n`),
+  );
+  return { id };
 }
 
 // Skelcrew's session name as hc takes a name: 1 to 32 of a-z, 0-9, - and _. A repository's
@@ -264,6 +272,12 @@ export async function end(q: z.infer<typeof End>) {
   }
   const still = await live(q.id);
   if (still) throw new Error(`${q.id} still runs after it was ended, on hc session ${still.core}`);
+  // Its tab in herdr's app closes. The agent is gone already, so a tab left open is only said on
+  // stderr. Only the default core's terminals have tabs.
+  if (at.core === "default")
+    await unplace(q.id).catch((error: unknown) =>
+      process.stderr.write(`${q.id}'s tab in herdr's app stays open: ${String(error)}\n`),
+    );
   return {};
 }
 
