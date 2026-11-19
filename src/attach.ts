@@ -1,6 +1,6 @@
 // The attach command Skelcrew runs in your terminal: `bun src/attach.ts <id>` puts your terminal
 // full screen on that session, through hc attach on Skelcrew's core, and returns when you detach
-// with Ctrl+\. It exits with hc attach's own code, so Skelcrew sees a failed attach as failed.
+// with Ctrl-Q. It exits with hc attach's own code, so Skelcrew sees a failed attach as failed.
 import { attachCommand } from "./host.ts";
 
 try {

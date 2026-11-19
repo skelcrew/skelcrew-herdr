@@ -34,10 +34,13 @@ function configHome(): string {
   return join(process.env.SKELCREW_HERDR_HOME || join(state, "skelcrew-herdr"), "config");
 }
 
-// The core's config.toml. draft_wait is in seconds, and a billion is over 31 years.
+// The core's config.toml. draft_wait is in seconds, and a billion is over 31 years. Ctrl-Q
+// detaches, as it does from Skelcrew's tmux sessions, so leaving an agent takes the same keys on
+// either host. Alt-Q, tmux's other key, can't be: hc's detach key is always a Ctrl chord.
 export const coreConfig = `# Written by skelcrew-herdr for its own hc core. Changes here are overwritten.
 notes = false
 draft_wait = 1000000000
+detach_key = "ctrl+q"
 `;
 
 // The socket Skelcrew's core listens on, found as hc 0.1.21 finds it on Linux and a Mac: in the

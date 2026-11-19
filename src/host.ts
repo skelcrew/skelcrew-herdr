@@ -205,8 +205,8 @@ export async function end(q: z.infer<typeof End>) {
 
 // The command that attaches your terminal to the session: it names the core's own socket, and
 // unsets what would make hc take the caller for a terminal of its own, so it reaches Skelcrew's
-// core whatever your environment holds, other runtime and state folders included. Ctrl+\
-// detaches, hc's key, not Skelcrew's Alt-Q.
+// core whatever your environment holds, other runtime and state folders included. Ctrl-Q
+// detaches, as the core's config sets it.
 export async function attachCommand(id: string): Promise<string[]> {
   Id.parse(id);
   // Checks the core is Skelcrew's, as every call does.
