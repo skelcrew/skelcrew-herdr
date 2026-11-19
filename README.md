@@ -141,7 +141,9 @@ Skelcrew's sandbox hides the home folder, so the agent can open a dropped file o
 - **Skelcrew** puts a marker where the folder goes: a path of its own, `/skelcrew-files-` and 32 hex digits, mounted read-only (`--ro-bind <marker> <marker>` for bubblewrap). It passes the marker to `start` as `files`.
 - **The relay** makes the session's folder, empty and only its owner's, and puts its path in place of every occurrence of the marker before it starts the agent. It knows the folder as hc does: the relay runs with the core's own environment (`XDG_STATE_HOME`, `HC_SESSION`) and the terminal's `HC_TERMINAL_ID`.
 
-So each agent sees its own session's drops, read-only, and no other session's. Without `files`, the command runs as given, and the agent can't open what is dropped. Skelcrew doesn't pass `files` yet.
+So each agent sees its own session's drops, read-only, and no other session's. Without `files`, the command runs as given, and the agent can't open what is dropped.
+
+**Not working yet.** Skelcrew doesn't pass `files` or mount the marker yet, so in real sessions, leads and builders alike, agents still can't open dropped files. That waits on a change in Skelcrew's sandbox. Until it lands, nobody has seen a dropped screenshot show as `[Image 1]` in Claude Code, or an agent read a dropped PDF.
 
 ## How status reaches herdr
 
