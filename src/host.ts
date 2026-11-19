@@ -6,7 +6,17 @@ import { randomBytes } from "node:crypto";
 import { closeSync, existsSync, mkdirSync, openSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { z } from "zod";
-import { coreSocket, ensureCore, HcError, hcBin, hcEnv, lines, rpc } from "./hc.ts";
+import {
+  type Core,
+  coreSocket,
+  cores,
+  ensureCore,
+  HcError,
+  hcBin,
+  hcEnv,
+  lines,
+  rpc,
+} from "./hc.ts";
 
 // A session's ID: its hc address, such as t7, which hc never gives another terminal, even after
 // this one is removed or the core restarts. A name could be taken over by a later terminal once
@@ -69,19 +79,43 @@ const Terminal = z.object({
 });
 type Terminal = z.infer<typeof Terminal>;
 
-async function get(session: string): Promise<Terminal> {
-  return Terminal.parse(await rpc("terminal.get", { terminal: session }));
+// Finds Skelcrew's terminal at the address `id`, and the core it is on, or undefined when none
+// is. Sessions this version starts are on the default core, but 0.1.0 started its own on the
+// `skelcrew` session, and those must still be reached, above all to end them. An address is
+// only unique on its own core, so a terminal counts only with Skelcrew's label: a person's own
+// terminal at the same address is never touched. A running one wins over one that ended, and
+// two running ones are an error, since neither can be told apart from the other.
+async function find(id: string): Promise<{ core: Core; t: Terminal } | undefined> {
+  const found: { core: Core; t: Terminal }[] = [];
+  for (const core of cores) {
+    try {
+      const t = Terminal.parse(await rpc("terminal.get", { terminal: id }, undefined, core));
+      if (t.labels.by === mark.by) found.push({ core, t });
+    } catch (error) {
+      if (!(error instanceof HcError && error.kind === "not_found")) throw error;
+    }
+  }
+  const running = found.filter((f) => f.t.state === "live");
+  if (running.length > 1)
+    throw new Error(
+      `${id} is a running agent on both hc sessions, default and skelcrew, so it can't be told ` +
+        `which one Skelcrew means. End the older one with HC_SESSION=skelcrew hc kill ${id}`,
+    );
+  return running[0] ?? found[0];
 }
 
-// The session's record while its program runs, or undefined once it ended or went.
-async function live(session: string): Promise<Terminal | undefined> {
-  try {
-    const t = await get(session);
-    return t.state === "live" ? t : undefined;
-  } catch (error) {
-    if (error instanceof HcError && error.kind === "not_found") return undefined;
-    throw error;
-  }
+// Skelcrew's terminal at `id` and its core, running or not. Throws when there is none.
+async function get(id: string): Promise<{ core: Core; t: Terminal }> {
+  const at = await find(id);
+  if (!at) throw new HcError("not_found", `no session of Skelcrew's is ${id}`);
+  return at;
+}
+
+// Skelcrew's terminal at `id` and its core while its program runs, or undefined once it ended
+// or went.
+async function live(id: string): Promise<{ core: Core; t: Terminal } | undefined> {
+  const at = await find(id);
+  return at?.t.state === "live" ? at : undefined;
 }
 
 // Starts `command` in `folder` with exactly `env`, in a new hc terminal labelled with `labels`,
@@ -152,15 +186,24 @@ function relaySocket(relay: string): string {
   return join(relayFolder(), `${relay}.sock`);
 }
 
-// Lists Skelcrew's sessions on this core, finished ones too, with their labels and whether the
-// agent runs, so a starting engine finds its agents again. A terminal whose labels aren't
-// Skelcrew's shape has null labels, and Skelcrew leaves it alone.
+// Lists Skelcrew's sessions, finished ones too, with their labels and whether the agent runs,
+// so a starting engine finds its agents again. Those 0.1.0 started on its own core are listed
+// too: missing, they would read as gone, and Skelcrew would start a second agent beside each. A
+// terminal whose labels aren't Skelcrew's shape has null labels, and Skelcrew leaves it alone.
 export async function list() {
-  const answer = z
-    .object({ terminals: z.array(Terminal) })
-    .parse(await rpc("terminal.list", { all: true, labels: mark }));
+  const terminals: Terminal[] = [];
+  for (const core of cores) {
+    try {
+      const answer = z
+        .object({ terminals: z.array(Terminal) })
+        .parse(await rpc("terminal.list", { all: true, labels: mark }, undefined, core));
+      terminals.push(...answer.terminals);
+    } catch (error) {
+      if (!(error instanceof HcError && error.kind === "not_found")) throw error;
+    }
+  }
   return {
-    sessions: answer.terminals.map((t) => {
+    sessions: terminals.map((t) => {
       const labels = HcLabels.safeParse(t.labels);
       const { repo, ...rest } = labels.success ? labels.data : { repo: "" };
       return {
@@ -176,16 +219,19 @@ export async function list() {
 // session whose agent ended still shows its last screen, so Skelcrew can say why it ended.
 export const Read = z.object({ id: Id });
 export async function read(q: z.infer<typeof Read>) {
+  const { core } = await get(q.id);
   const answer = z
     .object({ text: z.string() })
-    .parse(await rpc("terminal.read", { terminal: q.id, lines: 0 }));
+    .parse(await rpc("terminal.read", { terminal: q.id, lines: 0 }, undefined, core));
   return { screen: answer.text };
 }
 
 // Presses one key in the session, Enter or Esc, by hc's names for them.
 export const Keys = z.object({ id: Id, key: z.enum(["Enter", "Escape"]) });
 export async function keys(q: z.infer<typeof Keys>) {
-  await rpc("terminal.keys", { terminal: q.id, keys: [q.key === "Enter" ? "enter" : "esc"] });
+  const { core } = await get(q.id);
+  const pressed = { terminal: q.id, keys: [q.key === "Enter" ? "enter" : "esc"] };
+  await rpc("terminal.keys", pressed, undefined, core);
   return {};
 }
 
@@ -196,34 +242,41 @@ export async function keys(q: z.infer<typeof Keys>) {
 // for it, this says still_working until Skelcrew's screen check reports idle.
 export const Interrupt = z.object({ id: Id });
 export async function interrupt(q: z.infer<typeof Interrupt>) {
+  const { core } = await get(q.id);
   return z
     .object({ key: z.string(), outcome: z.string() })
-    .parse(await rpc("terminal.interrupt", { terminal: q.id, timeout: 1 }));
+    .parse(await rpc("terminal.interrupt", { terminal: q.id, timeout: 1 }, undefined, core));
 }
 
-// Ends the session: its program, then its record. hc's kill hangs up, then terminates, then
-// kills, and answers once the program ended, so Skelcrew can remove its clone after. Ending one
-// already gone is no error.
+// Ends the session: its program, then its record, on whichever core holds it. hc's kill hangs
+// up, then terminates, then kills, and answers once the program ended, so Skelcrew can remove
+// its clone after. Ending one already gone is no error. One still running afterwards is: an
+// answer here tells Skelcrew the agent is gone, and it may then start another in the same clone.
 export const End = z.object({ id: Id });
 export async function end(q: z.infer<typeof End>) {
+  const at = await find(q.id);
+  if (!at) return {};
   try {
-    if ((await get(q.id)).state === "live") await rpc("terminal.kill", { terminal: q.id });
-    await rpc("terminal.rm", { terminal: q.id });
+    if (at.t.state === "live") await rpc("terminal.kill", { terminal: q.id }, undefined, at.core);
+    await rpc("terminal.rm", { terminal: q.id }, undefined, at.core);
   } catch (error) {
     if (!(error instanceof HcError && error.kind === "not_found")) throw error;
   }
+  const still = await live(q.id);
+  if (still) throw new Error(`${q.id} still runs after it was ended, on hc session ${still.core}`);
   return {};
 }
 
-// The command that attaches your terminal to the session: it names the default core's socket,
+// The command that attaches your terminal to the session: it names its core's socket,
 // and unsets what would make hc take the caller for a terminal of its own or lead it to another
 // core, so it reaches the agents' core whatever your environment holds, other runtime and state
 // folders included. Your hc config's detach key leaves, Ctrl+\ unless you set one.
 export async function attachCommand(id: string): Promise<string[]> {
   Id.parse(id);
-  // Starts the core if none runs, as every call does, so its socket is there.
+  // Starts the default core if none runs, as every call does, so its socket is there. A session
+  // 0.1.0 started is on its own core.
   await ensureCore();
-  const socket = coreSocket();
+  const socket = coreSocket((await find(id))?.core ?? "default");
   if (!existsSync(socket)) throw new Error(`hc's default core has no socket at ${socket}`);
   const unset = ["HC_TERMINAL_ID", "HC_SCOPE", "HC_SESSION"].flatMap((k) => ["-u", k]);
   return ["/usr/bin/env", ...unset, `HC_SOCKET=${socket}`, hcBin(), "attach", id];
@@ -236,7 +289,7 @@ export async function attachCommand(id: string): Promise<string[]> {
 // answers at once.
 export const Idle = z.object({ id: Id });
 export async function idle(q: z.infer<typeof Idle>) {
-  return { idle: free((await live(q.id))?.status) };
+  return { idle: free((await live(q.id))?.t.status) };
 }
 
 // Reports whether a status leaves the agent free for a message, as `idle` says.
@@ -252,10 +305,10 @@ async function waitUntilIdle(id: string, timeout: number) {
   // A first look, as the session may already be idle or gone.
   const first = await live(id);
   if (!first) return { idle: false, state: undefined, ended: true };
-  let state = first.status?.state;
+  let state = first.t.status?.state;
   if (state && state !== "working") return { idle: true, state };
   const child = Bun.spawn([hcBin(), "events", "--terminal", id, "--json"], {
-    env: hcEnv(),
+    env: hcEnv(first.core),
     stdin: "ignore",
     stdout: "pipe",
     stderr: "ignore",
@@ -283,7 +336,7 @@ async function waitUntilIdle(id: string, timeout: number) {
   // The wait ran out, or hc events stopped: look once more.
   const last = await live(id);
   if (!last) return { idle: false, state: undefined, ended: true };
-  state = last.status?.state;
+  state = last.t.status?.state;
   return { idle: !!state && state !== "working", state };
 }
 
@@ -374,7 +427,7 @@ export async function deliver(q: z.infer<typeof Deliver>) {
   const deadline = q.timeout === null ? Infinity : Date.now() + q.timeout;
   const left = () => Math.max(0, deadline - Date.now());
   while (true) {
-    const t = await get(q.id);
+    const { core, t } = await get(q.id);
     if (t.state !== "live") throw new Error("it has ended");
     const state = t.status?.state;
     if (state === "blocked" && t.status?.kind)
@@ -406,6 +459,7 @@ export async function deliver(q: z.infer<typeof Deliver>) {
       "terminal.send",
       send,
       Number.isFinite(deadline) ? deadline : undefined,
+      core,
     ).then(
       () => null,
       (error: unknown) => error ?? new Error("the send failed"),
@@ -475,7 +529,7 @@ function shownFor(word: Word, reason: string): Shown {
 // it there, into the agent's own terminal: to hc it is the program speaking.
 async function report(session: string, expected: Shown | null, next: Shown): Promise<boolean> {
   return await locked(session, async () => {
-    const t = await live(session);
+    const t = (await live(session))?.t;
     if (!t) {
       if (expected) return false;
       throw new Error(`${session} isn't running`);
@@ -487,7 +541,7 @@ async function report(session: string, expected: Shown | null, next: Shown): Pro
     // hc reads the report as the terminal's output arrives, a moment after the write.
     const deadline = Date.now() + 2000;
     while (true) {
-      const now = await live(session);
+      const now = (await live(session))?.t;
       if (!now && expected) return false;
       if (same(now?.status, next)) break;
       if (Date.now() > deadline) throw new Error(`hc didn't show ${next.state} for ${session}`);
@@ -549,9 +603,10 @@ async function tellRelay(socket: string, fields: string): Promise<void> {
 // and the session, in the relays' folder. Nothing in a caller's environment
 // changes it, so every caller reaching that terminal takes the same lock.
 export async function lockPath(session: string): Promise<string> {
+  const core = (await find(session))?.core ?? "default";
   const status = z
     .object({ core: z.object({ id: z.string().regex(/^[A-Za-z0-9_-]+$/) }) })
-    .parse(await rpc("server.status", {}));
+    .parse(await rpc("server.status", {}, undefined, core));
   return join(relayFolder(), `${status.core.id}-${session}.flock`);
 }
 

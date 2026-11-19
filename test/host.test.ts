@@ -348,6 +348,96 @@ describe.skipIf(!bin)("sessions on herdr-core", () => {
   }, 20_000);
 });
 
+describe.skipIf(!bin)("sessions an older version started", () => {
+  // Version 0.1.0 ran its agents on a core of its own, the hc session `skelcrew`. This starts
+  // a terminal there as 0.1.0 labelled it, running `sleep`, and returns its address and pid.
+  const olderEnv = () => ({ ...process.env, HC_SESSION: "skelcrew" });
+  // Starts `sleep` in a terminal through hc on the core `env` reaches, with `labels`, and returns
+  // its address and pid.
+  function hcRun(env: Record<string, string | undefined>, labels: string[]) {
+    const json = (args: string[]) =>
+      JSON.parse(Bun.spawnSync([bin ?? "hc", ...args], { env }).stdout.toString());
+    const flags = labels.flatMap((label) => ["--label", label]);
+    const { address } = z
+      .object({ address: z.string() })
+      .parse(
+        json([
+          "run",
+          "--bg",
+          "--json",
+          "--no-parent",
+          "--cwd",
+          scratch,
+          ...flags,
+          "--",
+          "sleep",
+          "300",
+        ]),
+      );
+    const { pid } = z.object({ pid: z.number() }).parse(json(["get", address, "--json"]));
+    return { address, pid };
+  }
+  // A terminal on that core as 0.1.0 labelled it.
+  const startOlder = (name: string) =>
+    hcRun(olderEnv(), ["repo=simon/app", "role=builder", `name=${name}`, "by=skelcrew"]);
+  // Addresses count up on each core, so one there can be one of Skelcrew's running here too.
+  const runningHere = async () =>
+    new Set((await host.list()).sessions.filter((s) => s.running).map((s) => s.id));
+  // A terminal on that core whose address no running session on the default core has.
+  async function startOlderAlone(name: string) {
+    const taken = await runningHere();
+    while (true) {
+      const older = startOlder(name);
+      if (!taken.has(older.address)) return older;
+    }
+  }
+  const alive = (pid: number) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  afterAll(() => {
+    Bun.spawnSync([bin ?? "hc", "server", "stop", "--json"], { env: olderEnv(), stdout: "ignore" });
+  });
+
+  test("list finds them, and end stops them", async () => {
+    const older = await startOlderAlone("app-7");
+    const { sessions } = await host.list();
+    expect(sessions).toContainEqual({
+      id: older.address,
+      running: true,
+      labels: { repository: "simon/app", role: "builder" },
+    });
+    expect(await host.end({ id: older.address })).toEqual({});
+    for (let i = 0; i < 50 && alive(older.pid); i++) await Bun.sleep(20);
+    expect(alive(older.pid)).toBe(false);
+  }, 15_000);
+
+  test("a call to an address both cores run an agent at fails, and ends neither", async () => {
+    const here = await startAgent();
+    let older = startOlder("app-8");
+    while (older.address !== here) older = startOlder("app-8");
+    await expect(host.end({ id: here })).rejects.toThrow("on both hc sessions");
+    expect(alive(older.pid)).toBe(true);
+    expect((await host.list()).sessions.filter((s) => s.id === here && s.running)).toHaveLength(2);
+  }, 30_000);
+
+  test("end leaves alone a terminal at that address that isn't Skelcrew's", async () => {
+    // A person's own shell on the default core.
+    const own = hcRun(process.env, []);
+    try {
+      await host.end({ id: own.address });
+      expect(alive(own.pid)).toBe(true);
+    } finally {
+      await rpc("terminal.kill", { terminal: own.address });
+    }
+  }, 15_000);
+});
+
 describe.skipIf(!bin)("status on herdr-core", () => {
   test("each status Skelcrew reports is the status hc shows", async () => {
     const session = await startAgent();
