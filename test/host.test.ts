@@ -2,9 +2,9 @@
 // config and socket folders, so the machine's own core and its terminals are never touched.
 // Without hc on PATH (or HC_BIN), they are skipped, and say so.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { z } from "zod";
 import { answer } from "../src/call.ts";
 import { ensureCore, rpc, stopCore } from "../src/hc.ts";
@@ -367,6 +367,33 @@ describe.skipIf(!bin)("status on herdr-core", () => {
     // The report reached hc, not the agent's screen.
     expect(await screen(session)).not.toContain("7501");
   }, 20_000);
+
+  test("herdr shows the harness Skelcrew runs, however deep in the command it is", async () => {
+    // A stand-in for the harness, under the name Skelcrew starts it by, behind a sandbox.
+    const harness = join(scratch, "bin", "claude");
+    mkdirSync(dirname(harness), { recursive: true });
+    writeFileSync(harness, "#!/bin/sh\nexec sleep 30\n");
+    chmodSync(harness, 0o755);
+    const session = await startSession({
+      name: "shows-claude",
+      command: ["/usr/bin/env", "--", harness, "--model", "x"],
+      folder: scratch,
+      env: {},
+      labels: { repository: "simon/app", role: "builder" },
+    });
+    // The relay listens once it has started.
+    const { labels } = (await rpc("terminal.get", { terminal: session })) as {
+      labels: { relay: string };
+    };
+    const socket = join(`/tmp/skelcrew-herdr-${process.getuid?.()}`, `${labels.relay}.sock`);
+    for (let i = 0; i < 100 && !existsSync(socket); i++) await Bun.sleep(20);
+    await host.status({ id: session, status: "working", reason: "" });
+    const ls = Bun.spawnSync([bin ?? "hc", "ls", "--json"], { env: process.env });
+    const listed = z
+      .object({ terminals: z.array(z.object({ address: z.string(), agent: z.string() })) })
+      .parse(JSON.parse(ls.stdout.toString())).terminals;
+    expect(listed).toContainEqual({ address: session, agent: "claude" });
+  }, 15_000);
 
   test("the relay writes only a report's fields to the terminal", async () => {
     const session = await startAgent();

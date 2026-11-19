@@ -34,6 +34,8 @@ hc ls --label by=skelcrew
 hc ls --label repo=simon/app
 ```
 
+herdr shows each agent as its harness, `claude` or `codex`, from the `app` the relay puts in every status report. Until Skelcrew's first report, it shows the relay's own program.
+
 A name is unique only among live terminals. If one of yours already has it, the agent's terminal runs unnamed, and its `name` label still says which session it is.
 
 **Agents on a server.** To see a server's agents from your laptop, add the server as an hc machine with `hc machine add you@server`. This is separate from `sc --remote`. `sc --remote server --list` runs Skelcrew's list on the server over ssh, and Enter there runs `hc attach` on the server.
