@@ -2,7 +2,8 @@
 // data, in the shapes Skelcrew's session command speaks, so the call handler passes them on
 // unchanged. A session is an hc terminal, with labels for its repository, task and role.
 import { dlopen, FFIType } from "bun:ffi";
-import { closeSync, constants, existsSync, mkdirSync, openSync, writeSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { closeSync, existsSync, mkdirSync, openSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { z } from "zod";
 import { coreSocket, HcError, hcBin, hcEnv, lines, rpc } from "./hc.ts";
@@ -84,12 +85,13 @@ async function live(session: string): Promise<Terminal | undefined> {
 }
 
 // Starts `command` in `folder` with exactly `env`, in a new hc terminal labelled with `labels`,
-// and returns its ID. hc hands every terminal the core's own environment, so a token the core
-// has would reach the agent: `env -i` starts from nothing and sets exactly what was given,
-// terminal variables such as TERM included: hc's own (xterm-256color, truecolor, ghostty) only
-// when Skelcrew passes them. No parent, even when this runs inside an hc terminal, so the agent
-// never ends with the caller. Skelcrew's `name` for the session goes in a label, for a person
-// looking in herdr's apps.
+// and returns its ID. The command runs under the status relay (see relay.ts), which `status`
+// later reaches by the socket named in the terminal's `relay` label. hc hands every terminal the
+// core's own environment, so a token the core has would reach the agent: `env -i`, inside the
+// relay, starts from nothing and sets exactly what was given, terminal variables such as TERM
+// included: hc's own (xterm-256color, truecolor, ghostty) only when Skelcrew passes them. No
+// parent, even when this runs inside an hc terminal, so the agent never ends with the caller.
+// Skelcrew's `name` for the session goes in a label, for a person looking in herdr's apps.
 export const Start = z.object({
   name: z.string().min(1),
   command: z
@@ -107,14 +109,35 @@ export async function start(q: z.infer<typeof Start>) {
   // `--` ends env's options, so a name starting with - is set, not read as an option.
   const clean = ["/usr/bin/env", "-i", "--", ...env];
   const { repository, ...rest } = q.labels;
+  const relay = randomBytes(16).toString("hex");
+  mkdirSync(relayFolder(), { recursive: true, mode: 0o700 });
   const run = {
-    argv: [...clean, ...q.command],
+    argv: [...relayCommand(relaySocket(relay)), ...clean, ...q.command],
     cwd: q.folder,
-    labels: { repo: repository, ...rest, name: q.name, ...mark },
+    labels: { repo: repository, ...rest, name: q.name, relay, ...mark },
     no_parent: true,
   };
   const t = Terminal.parse(await rpc("terminal.run", run));
   return { id: t.address };
+}
+
+// The folder of this user's that holds the relays' sockets and the sessions' locks. It is in
+// /tmp, as a socket's path can be only about 100 bytes long.
+const relayFolder = () => join("/tmp", `skelcrew-herdr-${process.getuid?.() ?? "user"}`);
+
+// The socket of the relay named `relay` in a terminal's labels: random, so no other terminal's
+// relay is reached by mistake, and checked, as a label is outside input.
+function relaySocket(relay: string): string {
+  if (!/^[0-9a-f]{32}$/.test(relay)) throw new Error(`a relay can't be named ${relay}`);
+  return join(relayFolder(), `${relay}.sock`);
+}
+
+// The command that runs relay.ts listening on `socket`, with `--` before the agent's own
+// command. It runs on the Bun this program runs on. Skelcrew runs plugins on the Bun inside its
+// own single file, which acts as Bun only with BUN_BE_BUN set, so that is passed on when set.
+function relayCommand(socket: string): string[] {
+  const bun = process.env.BUN_BE_BUN ? ["/usr/bin/env", "BUN_BE_BUN=1"] : [];
+  return [...bun, process.execPath, join(import.meta.dir, "relay.ts"), socket, "--"];
 }
 
 // Lists Skelcrew's sessions on this core, finished ones too, with their labels and whether the
@@ -442,24 +465,19 @@ function shownFor(word: Word, reason: string): Shown {
 // that is false too; without it, an error. Reports for one session take turns: each waits until
 // hc shows the one before, so a delivery putting a status back can't undo a newer one from Skelcrew.
 //
-// herdr-core reads status only from OSC 7501 in a terminal's output, which is what its program
-// writes to its terminal. So the report is written to the session's terminal device itself, the
-// one its program has: to hc it is the program speaking. One write, which the terminal driver
-// keeps whole, between two of the program's own writes.
+// herdr-core reads status only from OSC 7501 in a terminal's output. The session's relay writes
+// it there, into the agent's own terminal: to hc it is the program speaking.
 async function report(session: string, expected: Shown | null, next: Shown): Promise<boolean> {
   return await locked(session, async () => {
     const t = await live(session);
-    if (!t?.pid) {
+    if (!t) {
       if (expected) return false;
       throw new Error(`${session} isn't running`);
     }
     if (expected && !same(t.status, expected)) return false;
-    const fd = openSync(ttyOf(t.pid), constants.O_WRONLY | constants.O_NOCTTY);
-    try {
-      writeSync(fd, osc7501(next));
-    } finally {
-      closeSync(fd);
-    }
+    const relay = t.labels.relay;
+    if (!relay) throw new Error(`${session} has no status relay`);
+    await tellRelay(relaySocket(relay), fieldsOf(next));
     // hc reads the report as the terminal's output arrives, a moment after the write.
     const deadline = Date.now() + 2000;
     while (true) {
@@ -473,24 +491,62 @@ async function report(session: string, expected: Shown | null, next: Shown): Pro
   });
 }
 
-// The OSC 7501 report for a status, with its message in base64 as the protocol carries text.
-export function osc7501(shown: Shown): string {
+// The fields of the OSC 7501 report for a status, with its message in base64 as the protocol
+// carries text.
+function fieldsOf(shown: Shown): string {
   const fields = [`state=${shown.state}`];
   if (shown.kind) fields.push(`kind=${shown.kind}`);
   if (shown.msg) fields.push(`msg=${Buffer.from(shown.msg).toString("base64")}`);
-  return `\x1b]7501;${fields.join(":")}\x1b\\`;
+  return fields.join(":");
 }
-export const oscFor = (word: Word, reason: string) => osc7501(shownFor(word, reason));
+export const fieldsFor = (word: Word, reason: string) => fieldsOf(shownFor(word, reason));
+
+// Hands the relay listening on `socket` one report's fields, and returns once it wrote them to
+// its terminal. Throws when it refuses them or doesn't answer within two seconds.
+async function tellRelay(socket: string, fields: string): Promise<void> {
+  let said = "";
+  const answered = new Promise<void>((resolve, reject) => {
+    Bun.connect({
+      unix: socket,
+      socket: {
+        open(conn) {
+          conn.write(`${fields}\n`);
+        },
+        data(_conn, bytes) {
+          said += new TextDecoder().decode(bytes);
+        },
+        close() {
+          if (said.trim() === "ok") resolve();
+          else reject(new Error(`the status relay at ${socket} said ${JSON.stringify(said)}`));
+        },
+        connectError(_conn, error) {
+          reject(error);
+        },
+      },
+    }).catch(reject);
+  });
+  let timer: Timer | undefined;
+  const late = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`the status relay at ${socket} didn't answer`)),
+      2000,
+    );
+  });
+  try {
+    await Promise.race([answered, late]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 // Where the lock for a session lives: a file named for the core it is on, by the core's own ID,
-// and the session, in a folder of this user's in /tmp. Nothing in a caller's environment
+// and the session, in the relays' folder. Nothing in a caller's environment
 // changes it, so every caller reaching that terminal takes the same lock.
 export async function lockPath(session: string): Promise<string> {
   const status = z
     .object({ core: z.object({ id: z.string().regex(/^[A-Za-z0-9_-]+$/) }) })
     .parse(await rpc("server.status", {}));
-  const folder = join("/tmp", `skelcrew-herdr-${process.getuid?.() ?? "user"}`);
-  return join(folder, `${status.core.id}-${session}.flock`);
+  return join(relayFolder(), `${status.core.id}-${session}.flock`);
 }
 
 // Runs `fn` holding the session's lock: the system's own lock on its file (flock), which the
@@ -527,14 +583,4 @@ function flock(): (fd: number, operation: number) => number {
     flockFn = (fd, operation) => symbols.flock(fd, operation);
   }
   return flockFn;
-}
-
-// The terminal device a process has, such as /dev/pts/3 or /dev/ttys003, by asking ps, which
-// works the same on Linux and a Mac.
-function ttyOf(pid: number): string {
-  const ps = Bun.spawnSync(["ps", "-o", "tty=", "-p", String(pid)], { stdout: "pipe" });
-  const name = ps.stdout.toString().trim();
-  if (!ps.success || !name || name === "?" || name === "??")
-    throw new Error(`process ${pid} has no terminal`);
-  return `/dev/${name}`;
 }

@@ -31,7 +31,7 @@ echo '{"ask":"list"}' | bun src/call.ts
 | `end` | `id` | | `terminal.kill`, then `terminal.rm` (`hc kill`, `hc rm`) |
 | `deliver` | `id`, `text`, `timeout` in milliseconds or null for none, and optionally the harness's screen `marks` (`busy`, `prompt`) | nothing when it went in. Exits 1 with why when it didn't, and then nothing was typed | `hc read` when given marks, then `terminal.send` with `if: idle`, never sent after the deadline, and cancelled if still held at it |
 | `idle` | `id` | `idle`, at once | `terminal.get` |
-| `status` | `id`, `status`, `reason` | the `status` hc then shows | OSC 7501 written to the session's terminal |
+| `status` | `id`, `status`, `reason` | the `status` hc then shows | OSC 7501, written into the session's terminal by its relay |
 
 `paste` isn't answered. It serves only Skelcrew's built-in transport, which this plugin's `deliver` replaces.
 
@@ -77,7 +77,8 @@ The installer doesn't start a core. The fake agent, `test/fake-agent.ts`, prints
 - `idle` for each status, and a `deliver` that didn't go in exiting 1
 - `interrupt`
 - `end`
-- the status hc shows after each report
+- the status hc shows after each report, through the relay, which refuses anything but a report
+- the agent's exit code passing through the relay, and `end` ending the agent under it
 
 Tested with hc 0.1.21.
 
@@ -103,18 +104,18 @@ Tested with hc 0.1.21.
 
 ## How status reaches herdr
 
-The core reads OSC 7501 out of a terminal's output, with its terminal parser. Anything written to the terminal's device counts, whoever writes it. The agent's process is one writer. But the agent runs in Skelcrew's sandbox, and its hooks call `sc`, not the terminal, so it can't report Skelcrew's status (needs you and ready come from the engine anyway). v6 proposes a relay: a program of the plugin's own between hc and the agent, writing OSC 7501 into the stream.
+The core reads OSC 7501 out of a terminal's output, with its terminal parser. The agent runs in Skelcrew's sandbox, and its hooks call `sc`, not the terminal, so it can't report Skelcrew's status (needs you and ready come from the engine anyway). And the engine, outside the terminal, can't write into it.
 
-**What this plugin does for now: the plugin writes the report to the session's terminal device.** `status` takes the terminal's `pid` from `hc get`, finds its tty with `ps -o tty= -p <pid>` (`/dev/pts/N` on Linux, `/dev/ttysNNN` on a Mac), and writes the report there in a single write. To hc, it is the program speaking. This has three advantages over a relay:
+So `start` runs the sandboxed command under a small relay, `src/relay.ts`, as the spec says:
 
-- No program sits between hc and the agent, so keys, resizes, the alternate screen and bracketed paste reach the agent exactly as hc sends them.
-- The sandboxed command is the pane's own process, with no PTY inside a PTY.
-- Nothing has to stay running to keep the channel open.
+- **Untouched.** The agent is the relay's child on the same terminal, with no terminal in between. Keys, resizes, the alternate screen and bracketed paste reach it exactly as hc sends them. The relay ignores Ctrl-C, Ctrl-\ and Ctrl-Z, which are the agent's.
+- **Its own socket.** The relay listens on a socket in `/tmp/skelcrew-herdr-<uid>/`, named by a random token kept in the terminal's `relay` label. `status` connects there and hands it one report's fields, such as `state=blocked:kind=question:msg=...`. The relay writes them as OSC 7501 to the terminal in a single write, and answers `ok`. It refuses anything but those fields, so nothing else reaches the terminal this way.
+- **Ends with the agent.** It exits with the agent's exit code, so hc records how the agent ended. hc's kill signals the terminal's whole process group, and the relay passes hangup and terminate on to the agent too, in case the sandbox started a group of its own.
 
-The engine runs as the same user, so it can open the device, and the sandbox never sees it. Its limits:
+Its limits:
 
 - **One write is never split, but it can land between two writes of the agent's.** Linux keeps each write to a terminal whole, so a report can't land in the middle of one of the agent's writes. If the agent writes one escape sequence across two writes, a report could land between them. Agents usually draw a frame with one write, but nothing guarantees it.
-- **It needs a local core.** It works only where the engine runs on the same machine as the terminal, which is how Skelcrew runs today. For a terminal on another machine (`hc run --on`), the report would have to be written there, such as through `hc exec --on <machine>`.
+- **A Bun process per agent.** The relay runs on the same Bun as the plugin, so each agent has one more small process beside it.
 - **Better: an API call.** The tidiest route would be a `terminal.status` call in hc's API that applies a report as if the program wrote it. The maintainers' rule is "Status comes only from OSC 7501", so this would have to be proposed as a report arriving over the API, not as status that hc infers.
 
 ## Findings for phase 5
@@ -129,7 +130,7 @@ The engine runs as the same user, so it can open the device, and the sandbox nev
 ## Open questions
 
 1. **Can anything print a fake status?** Anything that prints OSC 7501 to the terminal changes hc's status, including the agent printing a file that holds one. A false `idle` would let `deliver` type into a running turn. `deliver`'s screen check also refuses a screen whose busy mark is moving, as a running turn's status line does, which covers most of that. Skelcrew doesn't pass the harness's marks yet, so until it does, that check doesn't run.
-2. **Status from the API.** Ask herdr-core for a `terminal.status` call, or keep writing to the tty (see above)? Either way, if a harness ever writes OSC 7501 itself, two writers will fight over the root record. Should Skelcrew then report under a child record (`id=skelcrew`)?
+2. **Status from the API.** Ask herdr-core for a `terminal.status` call, or keep the relay (see above)? Either way, if a harness ever writes OSC 7501 itself, two writers will fight over the root record. Should Skelcrew then report under a child record (`id=skelcrew`)?
 3. **Never typing onto a draft, and guarding other states, in hc itself.** Two things would let Skelcrew run on the person's own core, and remove `deliver`'s temporary `idle` report. Ask herdr-core for them?
    - A per-send option to hold for a draft with no time limit.
    - `if` taking any status word, such as `if: done`.

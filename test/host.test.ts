@@ -233,7 +233,11 @@ describe.skipIf(!bin)("sessions on herdr-core", () => {
 
   test("end ends the agent and removes its session, and ending it again is no error", async () => {
     const session = await startAgent();
+    const pid = Number((await screen(session)).match(/pid: (\d+)/)?.[1]);
+    expect(pid).toBeGreaterThan(0);
     await host.end({ id: session });
+    // The agent itself, under the relay, is gone too.
+    expect(() => process.kill(pid, 0)).toThrow();
     expect((await host.list()).sessions.map((s) => s.id)).not.toContain(session);
     await host.end({ id: session });
   }, 15_000);
@@ -251,6 +255,9 @@ describe.skipIf(!bin)("sessions on herdr-core", () => {
       found = (await host.list()).sessions.find((s) => s.id === session);
     expect(found?.running).toBe(false);
     expect(await screen(session)).toContain("bye");
+    // The relay around the agent ends with the agent's own exit code.
+    const record = (await rpc("terminal.get", { terminal: session })) as { exit_code: unknown };
+    expect(record.exit_code).toBe(3);
   }, 15_000);
 
   test("attach is hc attach on the session, on Skelcrew's core whatever the caller's env", async () => {
@@ -305,6 +312,34 @@ describe.skipIf(!bin)("status on herdr-core", () => {
     // The report reached hc, not the agent's screen.
     expect(await screen(session)).not.toContain("7501");
   }, 20_000);
+
+  test("the relay writes only a report's fields to the terminal", async () => {
+    const session = await startAgent();
+    const record = (await rpc("terminal.get", { terminal: session })) as {
+      labels: { relay: string };
+    };
+    const socket = join(`/tmp/skelcrew-herdr-${process.getuid?.()}`, `${record.labels.relay}.sock`);
+    const send = (text: string) =>
+      new Promise<string>((resolve, reject) => {
+        let said = "";
+        Bun.connect({
+          unix: socket,
+          socket: {
+            open: (conn) => void conn.write(text),
+            data: (_conn, bytes) => {
+              said += new TextDecoder().decode(bytes);
+            },
+            close: () => resolve(said),
+            connectError: (_conn, error) => reject(error),
+          },
+        });
+      });
+    expect(await send("state=x\x1b]0;title\n")).toBe("refused\n");
+    expect(await statusOf(session)).toBeNull();
+    expect(await send("state=working\n")).toBe("ok\n");
+    for (let i = 0; i < 50 && (await statusOf(session)) !== "working"; i++) await Bun.sleep(20);
+    expect(await statusOf(session)).toBe("working");
+  }, 15_000);
 
   test("a status for a session that has ended is an error", async () => {
     await expect(host.status({ id: "nobody", status: "idle", reason: "" })).rejects.toThrow();
@@ -759,11 +794,11 @@ describe.skipIf(!bin)("a session's lock", () => {
   }, 20_000);
 });
 
-test("oscFor encodes a status the way hc reads it", () => {
-  expect(host.oscFor("needs you", "question")).toBe(
-    "\x1b]7501;state=blocked:kind=question:msg=cXVlc3Rpb24=\x1b\\",
+test("fieldsFor encodes a status the way hc reads it", () => {
+  expect(host.fieldsFor("needs you", "question")).toBe(
+    "state=blocked:kind=question:msg=cXVlc3Rpb24=",
   );
-  expect(host.oscFor("ready", "")).toBe("\x1b]7501;state=done\x1b\\");
+  expect(host.fieldsFor("ready", "")).toBe("state=done");
 });
 
 test("notReady tells a bare prompt from a draft, a menu and a busy screen", () => {
