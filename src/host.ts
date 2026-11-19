@@ -132,12 +132,24 @@ async function live(id: string): Promise<{ core: Core; t: Terminal } | undefined
 // parent, even when this runs inside an hc terminal, so the agent never ends with the caller.
 // The terminal is named after the session, such as skelcrew-430, so a person finds it in hc ls
 // and herdr's apps; Skelcrew's name goes in a label too, as it is.
+//
+// `files` is where the session's own files folder goes in the command. A file a person drops into
+// the session in herdr lands in that folder, and herdr types its path to the agent, so the
+// agent's sandbox must show it, read-only. The folder is named by the session's hc address, which
+// hc gives only once the terminal starts, after Skelcrew built the sandbox's command. So Skelcrew
+// puts a marker there instead: a path of its own, `/skelcrew-files-` and 32 hex digits, which
+// nothing else in the command holds. The relay makes the folder, empty and only its owner's, and
+// puts its path in place of every occurrence of the marker before it starts the agent.
 export const Start = z.object({
   name: z.string().min(1),
   command: z.array(z.string()).min(1),
   folder: z.string().min(1),
   env: z.record(z.string().regex(/^[^=\0]+$/), z.string()),
   labels: Labels,
+  files: z
+    .string()
+    .regex(/^\/skelcrew-files-[0-9a-f]{32}$/, "/skelcrew-files- and 32 hex digits")
+    .optional(),
 });
 export async function start(q: z.infer<typeof Start>) {
   const { repository, ...rest } = q.labels;
@@ -154,7 +166,11 @@ export async function start(q: z.infer<typeof Start>) {
       "--",
       ...q.command,
     ],
-    env: { ...bun, SKELCREW_AGENT_ENV: JSON.stringify(q.env) },
+    env: {
+      ...bun,
+      SKELCREW_AGENT_ENV: JSON.stringify(q.env),
+      ...(q.files ? { SKELCREW_FILES_MARK: q.files } : {}),
+    },
     cwd: q.folder,
     labels: { repo: repository, ...rest, name: q.name, relay, ...mark },
     no_parent: true,

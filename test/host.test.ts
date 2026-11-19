@@ -2,9 +2,20 @@
 // config and socket folders, so the machine's own core and its terminals are never touched.
 // Without hc on PATH (or HC_BIN), they are skipped, and say so.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { z } from "zod";
 import { answer } from "../src/call.ts";
 import { ensureCore, rpc, stopCore } from "../src/hc.ts";
@@ -1016,6 +1027,121 @@ describe.skipIf(!bin)("a session's lock", () => {
     await host.locked(session, async () => {});
     expect(Date.now() - started).toBeLessThan(1000);
   }, 20_000);
+});
+
+// Files a person drops into a session in herdr: hc puts each in the terminal's own files folder
+// and types its path to the agent, so the agent's sandbox must show that folder, and no other.
+describe.skipIf(!bin)("files dropped into a session", () => {
+  // A drop as herdr's apps make it: the file's bytes, put beside the terminal.
+  const drop = async (id: string, name: string, bytes: Uint8Array) =>
+    z.object({ path: z.string(), bytes: z.number() }).parse(
+      await rpc("terminal.put", {
+        terminal: id,
+        name,
+        data: Buffer.from(bytes).toString("base64"),
+      }),
+    );
+  // The marker Skelcrew puts in the command where the session's files folder goes.
+  const marker = () => `/skelcrew-files-${randomBytes(16).toString("hex")}`;
+  // A small PDF and PNG, as a person drops them.
+  const pdf = new TextEncoder().encode("%PDF-1.4\n1 0 obj << >> endobj\ntrailer << >>\n%%EOF\n");
+  const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
+
+  // Starts the fake agent with the marker in its command, as the sandbox's mount would hold it.
+  async function startWithFiles(name: string) {
+    const files = marker();
+    const session = await startSession({
+      name,
+      command: [process.execPath, fakeAgent, `--ro-bind=${files}`, `${files}/x`],
+      folder: scratch,
+      env: { PATH: "/usr/bin:/bin" },
+      labels: { repository: "simon/app", role: "builder" },
+      files,
+    });
+    const shown = await screenShows(session, "token:");
+    const argv = JSON.parse(shown.match(/argv: (\[.*\])/)?.[1] ?? "[]") as string[];
+    return { session, files, argv };
+  }
+
+  test("the command names the session's own files folder, made empty before anything is dropped", async () => {
+    const { session, files, argv } = await startWithFiles("drops-1");
+    const folder = argv[0]?.replace(/^--ro-bind=/, "") ?? "";
+    expect(argv).toEqual([`--ro-bind=${folder}`, `${folder}/x`]);
+    expect(argv.join(" ")).not.toContain(files);
+    expect(readdirSync(folder)).toEqual([]);
+    expect(statSync(folder).mode & 0o777).toBe(0o700);
+    // hc puts a drop there: a PDF whose name has spaces, its bytes as they were.
+    const put = await drop(session, "Quarterly report 2026.pdf", pdf);
+    expect(dirname(put.path)).toBe(folder);
+    expect(basename(put.path)).not.toContain(" ");
+    expect(new Uint8Array(readFileSync(put.path))).toEqual(pdf);
+    // And removes the folder with the session.
+    await host.end({ id: session });
+    expect(existsSync(folder)).toBe(false);
+  }, 15_000);
+
+  test("each session's drops land in its own folder, never another's", async () => {
+    const one = await startWithFiles("drops-2");
+    const two = await startWithFiles("drops-3");
+    const first = await drop(one.session, "Screenshot 2026-11-19 at 20.14.53.png", png);
+    const second = await drop(two.session, "Screenshot 2026-11-19 at 20.14.53.png", png);
+    expect(dirname(first.path)).not.toBe(dirname(second.path));
+    expect(readdirSync(dirname(first.path))).toEqual([basename(first.path)]);
+    expect(readdirSync(dirname(second.path))).toEqual([basename(second.path)]);
+  }, 15_000);
+
+  test("start refuses a marker that isn't Skelcrew's", async () => {
+    for (const files of ["/home", "/skelcrew-files-x", `/skelcrew-files-${"a".repeat(32)}/..`])
+      await expect(
+        answer({
+          ask: "start",
+          name: "app-1",
+          command: ["sleep", "30"],
+          folder: scratch,
+          env: {},
+          labels: { repository: "simon/app", role: "builder" },
+          files,
+        }),
+      ).rejects.toThrow();
+  });
+
+  // A sandbox that hides the core's state, as Skelcrew's hides the home folder that holds it,
+  // and shows the session's files folder read-only at the marker's place. bubblewrap needs
+  // namespaces a user may make, which some machines and CI runners don't allow.
+  const bwrap = Bun.which("bwrap");
+  const nests = !!bwrap && Bun.spawnSync([bwrap, "--ro-bind", "/", "/", "true"]).exitCode === 0;
+  test.skipIf(!nests)(
+    "a sandboxed agent reads its own drops, and sees no other session's",
+    async () => {
+      const other = await startWithFiles("drops-4");
+      const theirs = await drop(other.session, "theirs.png", png);
+      const files = marker();
+      const state = join(scratch, "state");
+      // The agent's side: it reads what is dropped into its folder, and tries the other's.
+      const script =
+        'echo ready; while read -r path; do cat "$path" >/dev/null && echo "read: $path";' +
+        ' ls "$1" >/dev/null 2>&1 || echo "hidden: $1"; touch "$path.new" 2>/dev/null || echo "read-only"; done';
+      const session = await startSession({
+        name: "drops-5",
+        command: [
+          ...[bwrap ?? "bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc"],
+          ...["--tmpfs", state, "--ro-bind", files, files, "--", "sh", "-c", script, "sh"],
+          dirname(theirs.path),
+        ],
+        folder: scratch,
+        env: { PATH: "/usr/bin:/bin" },
+        labels: { repository: "simon/app", role: "builder" },
+        files,
+      });
+      await screenShows(session, "ready");
+      const ours = await drop(session, "My screenshot.png", png);
+      await rpc("terminal.send", { terminal: session, text: ours.path });
+      const shown = await screenShows(session, "read-only");
+      expect(shown).toContain(`read: ${ours.path}`);
+      expect(shown).toContain(`hidden: ${dirname(theirs.path)}`);
+    },
+    20_000,
+  );
 });
 
 test("fieldsFor encodes a status the way hc reads it", () => {
