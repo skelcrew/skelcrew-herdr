@@ -1,24 +1,35 @@
 // Skelcrew's sessions, transport and status on herdr-core. Each function takes and returns plain
-// data, so phase 5's runtime plugin can call it from its call handler unchanged. A session is an
-// hc terminal, named by Skelcrew, with labels for its repository, task and role.
+// data, in the shapes Skelcrew's session command speaks, so the call handler passes them on
+// unchanged. A session is an hc terminal, with labels for its repository, task and role.
 import { dlopen, FFIType } from "bun:ffi";
 import { closeSync, constants, existsSync, mkdirSync, openSync, writeSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { z } from "zod";
 import { coreSocket, HcError, hcBin, hcEnv, lines, rpc } from "./hc.ts";
 
-// A session's name, which is its ID: hc's rule for a terminal's name, unique among live ones.
-export const Session = z.string().regex(/^[a-z0-9_-]{1,32}$/, "1-32 of a-z, 0-9, - and _");
+// A session's ID: its hc address, such as t7, which hc never gives another terminal, even after
+// this one is removed or the core restarts. A name could be taken over by a later terminal once
+// this one finished, and Skelcrew's own names, such as a repository with a dot in it, can break
+// hc's rule for names. It is checked against that rule all the same, as it goes into a file name.
+export const Id = z.string().regex(/^[a-z0-9_-]{1,32}$/, "1-32 of a-z, 0-9, - and _");
 
-// What every session carries, as hc labels: its repository as owner/name, its role, and for a
-// builder its task, such as app-12. `by=skelcrew` marks Skelcrew's own among hc's terminals,
-// since a label filter matches values, and other programs may use `repo` too.
+// What every session carries, as Skelcrew gives them: its repository as owner/name, its role,
+// and for a builder its task, such as app-12.
 export const Labels = z.object({
-  repo: z.string().min(1),
+  repository: z.string().min(1),
   role: z.enum(["lead", "builder"]),
   task: z.string().min(1).optional(),
 });
 export type Labels = z.infer<typeof Labels>;
+
+// The same labels as hc keeps them, under the short names herdr's apps show: `repo`, `role` and
+// `task`. `by=skelcrew` marks Skelcrew's own among hc's terminals, since a label filter matches
+// values, and other programs may use `repo` too.
+const HcLabels = z.object({
+  repo: z.string().min(1),
+  role: z.enum(["lead", "builder"]),
+  task: z.string().min(1).optional(),
+});
 const mark = { by: "skelcrew" };
 
 // The status words Skelcrew shows, and the OSC 7501 state each becomes. needs you is `blocked`
@@ -72,15 +83,16 @@ async function live(session: string): Promise<Terminal | undefined> {
   }
 }
 
-// Starts `argv` in `folder` with exactly `env`, in a new hc terminal named `session`, labelled.
-// hc hands every terminal the core's own environment, so a token the core has would reach the
-// agent: `env -i` starts from nothing and sets exactly what was given, terminal variables such
-// as TERM included: hc's own (xterm-256color, truecolor, ghostty) only when Skelcrew passes
-// them. No parent, even when this runs inside an hc terminal, so the agent never ends with the
-// caller.
+// Starts `command` in `folder` with exactly `env`, in a new hc terminal labelled with `labels`,
+// and returns its ID. hc hands every terminal the core's own environment, so a token the core
+// has would reach the agent: `env -i` starts from nothing and sets exactly what was given,
+// terminal variables such as TERM included: hc's own (xterm-256color, truecolor, ghostty) only
+// when Skelcrew passes them. No parent, even when this runs inside an hc terminal, so the agent
+// never ends with the caller. Skelcrew's `name` for the session goes in a label, for a person
+// looking in herdr's apps.
 export const Start = z.object({
-  session: Session,
-  argv: z
+  name: z.string().min(1),
+  command: z
     .array(z.string())
     .min(1)
     .refine(([program]) => !program?.includes("=") && !program?.startsWith("-"), {
@@ -91,108 +103,89 @@ export const Start = z.object({
   labels: Labels,
 });
 export async function start(q: z.infer<typeof Start>) {
-  // A name is a session's ID, so it must name one terminal. hc refuses a name a live terminal
-  // has, but lets a new one take the name of one that finished and is still kept, which would
-  // then answer to the same ID. So any kept terminal with the name refuses it too, until `end`
-  // removes it. The look and the start happen under the session's lock, which every caller on
-  // this core takes, so two starts under one name can't both pass the look.
-  return await locked(q.session, () => startNow(q));
-}
-
-async function startNow(q: z.infer<typeof Start>) {
-  const kept = z
-    .object({ terminals: z.array(Terminal) })
-    .parse(await rpc("terminal.list", { all: true }));
-  if (kept.terminals.some((t) => t.name === q.session))
-    throw new HcError(
-      "name_taken",
-      `a session named ${q.session} is still kept (end it first, or start under another name)`,
-    );
   const env = Object.entries(q.env).map(([k, v]) => `${k}=${v}`);
   // `--` ends env's options, so a name starting with - is set, not read as an option.
   const clean = ["/usr/bin/env", "-i", "--", ...env];
+  const { repository, ...rest } = q.labels;
   const run = {
-    argv: [...clean, ...q.argv],
+    argv: [...clean, ...q.command],
     cwd: q.folder,
-    name: q.session,
-    labels: { ...q.labels, ...mark },
+    labels: { repo: repository, ...rest, name: q.name, ...mark },
     no_parent: true,
   };
   const t = Terminal.parse(await rpc("terminal.run", run));
-  return { session: q.session, address: t.address };
+  return { id: t.address };
 }
 
-// Lists Skelcrew's sessions on this core, finished ones too, with their labels, whether the
-// agent runs, its status and how it ended, so a starting engine finds its agents again.
+// Lists Skelcrew's sessions on this core, finished ones too, with their labels and whether the
+// agent runs, so a starting engine finds its agents again. A terminal whose labels aren't
+// Skelcrew's shape has null labels, and Skelcrew leaves it alone.
 export async function list() {
   const answer = z
     .object({ terminals: z.array(Terminal) })
     .parse(await rpc("terminal.list", { all: true, labels: mark }));
   return {
-    sessions: answer.terminals.flatMap((t) => {
-      if (!t.name) return [];
-      const labels = Labels.safeParse(t.labels);
-      return [
-        {
-          session: t.name,
-          running: t.state === "live",
-          labels: labels.success ? labels.data : null,
-          status: wordOf(t.status?.state),
-          ...(t.state === "live" ? {} : { ended: { reason: t.reason, exit_code: t.exit_code } }),
-        },
-      ];
+    sessions: answer.terminals.map((t) => {
+      const labels = HcLabels.safeParse(t.labels);
+      const { repo, ...rest } = labels.success ? labels.data : { repo: "" };
+      return {
+        id: t.address,
+        running: t.state === "live",
+        labels: labels.success ? { repository: repo, ...rest } : null,
+      };
     }),
   };
 }
 
-// Returns what the session shows: its screen, and `lines` lines of history above it.
-export const Read = z.object({ session: Session, lines: z.number().int().min(0).default(0) });
+// Returns what the session shows now, for typing, Skelcrew's screen check and `sc peek`. A
+// session whose agent ended still shows its last screen, so Skelcrew can say why it ended.
+export const Read = z.object({ id: Id });
 export async function read(q: z.infer<typeof Read>) {
   const answer = z
     .object({ text: z.string() })
-    .parse(await rpc("terminal.read", { terminal: q.session, lines: q.lines }));
-  return { text: answer.text };
+    .parse(await rpc("terminal.read", { terminal: q.id, lines: 0 }));
+  return { screen: answer.text };
 }
 
-// Presses keys in the session, by hc's names: enter, esc, up, ctrl+c.
-export const Keys = z.object({ session: Session, keys: z.array(z.string().min(1)).min(1) });
+// Presses one key in the session, Enter or Esc, by hc's names for them.
+export const Keys = z.object({ id: Id, key: z.enum(["Enter", "Escape"]) });
 export async function keys(q: z.infer<typeof Keys>) {
-  await rpc("terminal.keys", { terminal: q.session, keys: q.keys });
+  await rpc("terminal.keys", { terminal: q.id, keys: [q.key === "Enter" ? "enter" : "esc"] });
   return {};
 }
 
 // Stops the agent's turn. hc presses Esc for a program that ever reported a status, which every
-// Skelcrew session has once `status` ran, and ctrl+c otherwise. Then it watches `timeout`
-// seconds for the status to leave working and says what it saw: `stopped`, `still_working`,
-// `exited`, or `unknown`. Only `status` changes the status, so after Esc on Claude Code, which
-// has no hook for it, this says still_working until Skelcrew's screen check reports idle.
-export const Interrupt = z.object({ session: Session, timeout: z.number().min(0).default(1) });
+// Skelcrew session has once `status` ran, and ctrl+c otherwise. Then it watches a second for the
+// status to leave working and says what it saw: `stopped`, `still_working`, `exited`, or
+// `unknown`. Only `status` changes the status, so after Esc on Claude Code, which has no hook
+// for it, this says still_working until Skelcrew's screen check reports idle.
+export const Interrupt = z.object({ id: Id });
 export async function interrupt(q: z.infer<typeof Interrupt>) {
-  const answer = z
+  return z
     .object({ key: z.string(), outcome: z.string() })
-    .parse(await rpc("terminal.interrupt", { terminal: q.session, timeout: q.timeout }));
-  return answer;
+    .parse(await rpc("terminal.interrupt", { terminal: q.id, timeout: 1 }));
 }
 
-// Ends the session: its program, then its record. Ending one already gone is no error.
-export const End = z.object({ session: Session });
+// Ends the session: its program, then its record. hc's kill hangs up, then terminates, then
+// kills, and answers once the program ended, so Skelcrew can remove its clone after. Ending one
+// already gone is no error.
+export const End = z.object({ id: Id });
 export async function end(q: z.infer<typeof End>) {
   try {
-    if ((await get(q.session)).state === "live")
-      await rpc("terminal.kill", { terminal: q.session });
-    await rpc("terminal.rm", { terminal: q.session });
+    if ((await get(q.id)).state === "live") await rpc("terminal.kill", { terminal: q.id });
+    await rpc("terminal.rm", { terminal: q.id });
   } catch (error) {
     if (!(error instanceof HcError && error.kind === "not_found")) throw error;
   }
   return {};
 }
 
-// The command that attaches your terminal to the session, for Skelcrew to run in your terminal
-// as it is: it names the core's own socket, and unsets what would make hc take the caller for a
-// terminal of its own, so it reaches Skelcrew's core whatever your environment holds, other
-// runtime and state folders included. Ctrl+\ detaches, hc's key, not Skelcrew's Alt-Q.
-export const Attach = z.object({ session: Session });
-export async function attach(q: z.infer<typeof Attach>) {
+// The command that attaches your terminal to the session: it names the core's own socket, and
+// unsets what would make hc take the caller for a terminal of its own, so it reaches Skelcrew's
+// core whatever your environment holds, other runtime and state folders included. Ctrl+\
+// detaches, hc's key, not Skelcrew's Alt-Q.
+export async function attachCommand(id: string): Promise<string[]> {
+  Id.parse(id);
   // Checks the core is Skelcrew's, as every call does.
   await rpc("server.status", {});
   const { HC_SESSION, XDG_CONFIG_HOME } = hcEnv();
@@ -204,54 +197,65 @@ export async function attach(q: z.infer<typeof Attach>) {
     `HC_SESSION=${HC_SESSION}`,
     `XDG_CONFIG_HOME=${XDG_CONFIG_HOME}`,
   ];
-  return { argv: ["/usr/bin/env", ...unset, ...set, hcBin(), "attach", q.session] };
+  return ["/usr/bin/env", ...unset, ...set, hcBin(), "attach", id];
 }
 
-// Waits until the agent isn't working, for at most `timeout` seconds, by following hc's events.
-// Says whether it got there, and its status: idle, ready, needs you or error all leave a
-// message free to go, as Skelcrew's messages module already decided it may. `ended` when the
-// session ended or went.
-export const Idle = z.object({ session: Session, timeout: z.number().min(0).default(50) });
+// Says whether the agent can take a message now: idle, ready, needs you with no question open,
+// or an error all leave it free, as Skelcrew's messages module already decided it may send. A
+// turn still running, an open question or permission, which typing would answer, an agent that
+// reported nothing yet, or one that ended, are not idle. Skelcrew asks this to decide, so it
+// answers at once.
+export const Idle = z.object({ id: Id });
 export async function idle(q: z.infer<typeof Idle>) {
-  // A first look, which also checks the core is Skelcrew's, as every call does. Only hc saying
-  // the session finished or went counts as ended: a wait that ran out says only what it saw.
-  const first = await live(q.session);
-  if (!first) return { idle: false, status: null, ended: true };
-  // hc's own state word, until it is answered as Skelcrew's.
-  let status = first.status?.state;
-  if (status && status !== "working") return { idle: true, status: wordOf(status) };
-  const child = Bun.spawn([hcBin(), "events", "--terminal", q.session, "--json"], {
+  return { idle: free((await live(q.id))?.status) };
+}
+
+// Reports whether a status leaves the agent free for a message, as `idle` says.
+function free(shown: Shown | null | undefined): boolean {
+  if (!shown || shown.state === "working") return false;
+  return !(shown.state === "blocked" && shown.kind);
+}
+
+// Waits until the agent isn't working, for at most `timeout` milliseconds, by following hc's
+// events. Says whether it got there, the state hc last showed, and `ended` when the session
+// ended or went. Only hc saying so counts as ended: a wait that ran out says only what it saw.
+async function waitUntilIdle(id: string, timeout: number) {
+  // A first look, which also checks the core is Skelcrew's, as every call does.
+  const first = await live(id);
+  if (!first) return { idle: false, state: undefined, ended: true };
+  let state = first.status?.state;
+  if (state && state !== "working") return { idle: true, state };
+  const child = Bun.spawn([hcBin(), "events", "--terminal", id, "--json"], {
     env: hcEnv(),
     stdin: "ignore",
     stdout: "pipe",
     stderr: "ignore",
   });
-  const timer = setTimeout(() => child.kill(), q.timeout * 1000);
+  const timer = Number.isFinite(timeout) ? setTimeout(() => child.kill(), timeout) : undefined;
   try {
     for await (const line of lines(child.stdout)) {
       const message = JSON.parse(line);
       // The first line is the snapshot, then one notification per change.
       if (message.terminals) {
         const record = message.terminals[0];
-        if (record?.state !== "live") return { idle: false, status: null, ended: true };
-        status = record.status?.state;
+        if (record?.state !== "live") return { idle: false, state: undefined, ended: true };
+        state = record.status?.state;
       }
       const event = message.params;
-      if (event?.type === "status") status = event.data.status?.state;
+      if (event?.type === "status") state = event.data.status?.state;
       if (event?.type === "finished" || event?.type === "removed")
-        return { idle: false, status: wordOf(status), ended: true };
-      if (status && status !== "working") return { idle: true, status: wordOf(status) };
+        return { idle: false, state, ended: true };
+      if (state && state !== "working") return { idle: true, state };
     }
   } finally {
     clearTimeout(timer);
     child.kill();
   }
   // The wait ran out, or hc events stopped: look once more.
-  const last = await live(q.session);
-  if (!last) return { idle: false, status: null, ended: true };
-  status = last.status?.state;
-  if (status && status !== "working") return { idle: true, status: wordOf(status) };
-  return { idle: false, status: wordOf(status) };
+  const last = await live(id);
+  if (!last) return { idle: false, state: undefined, ended: true };
+  state = last.status?.state;
+  return { idle: !!state && state !== "working", state };
 }
 
 // What a harness's screen shows: `busy` while a turn runs, and a line starting with `prompt`
@@ -299,8 +303,8 @@ const draftReason = "a person's unsent draft is at its prompt";
 // still output. A busy mark still at a ready prompt gets one more look, long enough for a status
 // line to redraw: Claude Code's spinner and Codex's "Working" line count seconds, so they redraw
 // at least once a second, and the first two looks can fall between two ticks.
-async function whyNotReady(session: string, marks: Marks): Promise<string> {
-  const look = async () => (await read({ session, lines: 0 })).text;
+async function whyNotReady(id: string, marks: Marks): Promise<string> {
+  const look = async () => (await read({ id })).screen;
   const before = await look();
   await Bun.sleep(moment);
   const after = await look();
@@ -315,8 +319,9 @@ const moment = 500;
 const statusLineWatch = 1500;
 
 // Types `text` and Enter into the agent once it isn't working, never into a running turn and
-// never onto a person's unsent draft, waiting at most `timeout` seconds. Answers whether it
-// went in and, when not, why: then nothing was typed.
+// never onto a person's unsent draft, waiting at most `timeout` milliseconds, or with no limit
+// when it is null. Throws saying why when the text didn't go in: then nothing was typed, and
+// Skelcrew keeps the message to send again. An answer means it went in.
 //
 // Never into a running turn: hc types only through a send `if` idle, which hc checks at the
 // moment it types, whatever happened while the send was held. `if` knows only idle and working,
@@ -325,50 +330,54 @@ const statusLineWatch = 1500;
 // reported another meanwhile. A report of working while the send is held then stops it.
 //
 // Never onto a draft: hc holds a send while a person has a draft, the screen shows it or not,
-// and on Skelcrew's core that hold has no end (see hc.ts). A send goes only once the screen
-// shows an empty prompt, by the harness's `marks`, which also catches a draft hc never saw, such
+// and on Skelcrew's core that hold has no end (see hc.ts). Given the harness's `marks`, a send
+// also goes only once the screen shows an empty prompt, which catches a draft hc never saw, such
 // as one typed before the core restarted. A send still held at the deadline is cancelled, which
 // hc honours only before typing, so the answer is certain. After typing, hc watches up to 5
 // seconds for the agent to start working, so the answer can come that much after the deadline.
 export const Deliver = z.object({
-  session: Session,
+  id: Id,
   text: z.string().min(1),
-  marks: Marks,
-  timeout: z.number().min(0).default(50),
+  marks: Marks.optional(),
+  timeout: z.number().min(0).nullable().default(60_000),
 });
 export async function deliver(q: z.infer<typeof Deliver>) {
-  const deadline = Date.now() + q.timeout * 1000;
+  const deadline = q.timeout === null ? Infinity : Date.now() + q.timeout;
   const left = () => Math.max(0, deadline - Date.now());
   while (true) {
-    const t = await get(q.session);
-    if (t.state !== "live") return { delivered: false, why: "it has ended" };
+    const t = await get(q.id);
+    if (t.state !== "live") throw new Error("it has ended");
     const state = t.status?.state;
     if (state === "blocked" && t.status?.kind)
-      return { delivered: false, why: `it shows a ${t.status.kind}, which typing would answer` };
+      throw new Error(`it shows a ${t.status.kind}, which typing would answer`);
     if (!state || state === "working") {
-      if (left() === 0) return { delivered: false, why: `it was ${wordOf(state) ?? "silent"}` };
-      const waited = await idle({ session: q.session, timeout: left() / 1000 });
-      if (waited.ended) return { delivered: false, why: "it has ended" };
-      if (!waited.idle) return { delivered: false, why: `it was ${waited.status ?? "silent"}` };
+      if (left() === 0) throw new Error(`it was ${wordOf(state) ?? "silent"}`);
+      const waited = await waitUntilIdle(q.id, left());
+      if (waited.ended) throw new Error("it has ended");
+      if (!waited.idle) throw new Error(`it was ${wordOf(waited.state) ?? "silent"}`);
       continue;
     }
-    const why = await whyNotReady(q.session, q.marks);
+    const why = q.marks ? await whyNotReady(q.id, q.marks) : "";
     if (why) {
-      if (left() === 0) return { delivered: false, why };
+      if (left() === 0) throw new Error(why);
       await Bun.sleep(Math.min(250, left()));
       continue;
     }
     // Nothing is sent once the time is up, as a send can type before its cancel arrives.
-    const late = { delivered: false, why: "its time ran out before it was ready" };
-    if (left() === 0) return late;
+    const late = "its time ran out before it was ready";
+    if (left() === 0) throw new Error(late);
     const shown = t.status ?? { state };
-    if (state !== "idle" && !(await report(q.session, shown, delivering))) continue;
+    if (state !== "idle" && !(await report(q.id, shown, delivering))) continue;
     if (left() === 0) {
-      if (state !== "idle") await report(q.session, delivering, shown);
-      return late;
+      if (state !== "idle") await report(q.id, delivering, shown);
+      throw new Error(late);
     }
-    const send = { terminal: q.session, text: q.text, if: "idle" };
-    const failed = await rpc("terminal.send", send, deadline).then(
+    const send = { terminal: q.id, text: q.text, if: "idle" };
+    const failed = await rpc(
+      "terminal.send",
+      send,
+      Number.isFinite(deadline) ? deadline : undefined,
+    ).then(
       () => null,
       (error: unknown) => error ?? new Error("the send failed"),
     );
@@ -377,22 +386,21 @@ export async function deliver(q: z.infer<typeof Deliver>) {
     const notPutBack =
       state === "idle"
         ? null
-        : await report(q.session, delivering, shown).then(
+        : await report(q.id, delivering, shown).then(
             () => null,
             (error: unknown) => error ?? new Error("putting the status back failed"),
           );
-    // Putting the status back never hides that the text went in, as the caller would send it
+    // Putting the status back never hides that the text went in, as Skelcrew would send it
     // again.
-    if (!failed) return { delivered: true };
+    if (!failed) return {};
     if (!(failed instanceof HcError)) throw failed;
     if (notPutBack) throw notPutBack;
     // The status changed before typing: look again.
     if (failed.kind === "status_mismatch") continue;
     // Held by a person's typing until the deadline.
-    if (failed.kind === "cancelled")
-      return { delivered: false, why: "a person's typing at its prompt held it" };
+    if (failed.kind === "cancelled") throw new Error("a person's typing at its prompt held it");
     // The time ran out while connecting, so nothing was sent.
-    if (failed.kind === "late") return late;
+    if (failed.kind === "late") throw new Error(late);
     throw failed;
   }
 }
@@ -408,13 +416,13 @@ const same = (a: Shown | null | undefined, b: Shown) =>
 // Shows a status on herdr: Skelcrew's word for the session, with a short reason, such as
 // `question` or `round limit`. Returns the status hc then shows.
 export const Status = z.object({
-  session: Session,
+  id: Id,
   status: Word,
   reason: z.string().default(""),
 });
 export async function status(q: z.infer<typeof Status>) {
   const wanted = shownFor(q.status, q.reason);
-  await report(q.session, null, wanted);
+  await report(q.id, null, wanted);
   return { status: wordOf(wanted.state) };
 }
 
@@ -431,8 +439,8 @@ function shownFor(word: Word, reason: string): Shown {
 
 // Reports `next` to hc, if it still shows `expected` (any status when null), and returns
 // whether it did. With `expected`, a session that ended or went has nothing to report on, and
-// that is false too; without it, an error. Reports for one session take turns: each waits until hc shows the one before,
-// so a delivery putting a status back can't undo a newer one from Skelcrew.
+// that is false too; without it, an error. Reports for one session take turns: each waits until
+// hc shows the one before, so a delivery putting a status back can't undo a newer one from Skelcrew.
 //
 // herdr-core reads status only from OSC 7501 in a terminal's output, which is what its program
 // writes to its terminal. So the report is written to the session's terminal device itself, the

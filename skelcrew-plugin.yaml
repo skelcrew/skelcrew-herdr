@@ -1,0 +1,10 @@
+name: herdr
+version: 0.1.0
+skelcrew: 0.1.3
+about: Runs Skelcrew's builders in herdr-core, so herdr's apps show them
+kind: runtime
+provides: [sessions, transport, status]
+build:
+  - [bun, install, --frozen-lockfile, --production]
+session: [bun, src/call.ts]
+attach: [bun, src/attach.ts]

@@ -20,7 +20,6 @@ const draftReason = "a person's unsent draft is at its prompt";
 let scratch = "";
 // The socket's path is limited to about 100 bytes, so its folder is a short one in /tmp.
 let sockets = "";
-let names = 0;
 const started: string[] = [];
 
 beforeAll(async () => {
@@ -51,7 +50,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   if (!bin) return;
-  for (const session of started) await host.end({ session });
+  for (const id of started) await host.end({ id });
   await stopCore().catch(() => {});
   rmSync(scratch, { recursive: true, force: true });
   rmSync(sockets, { recursive: true, force: true });
@@ -63,18 +62,27 @@ function personConfig(text: string) {
   writeFileSync(join(scratch, "config", "herdr-core", "config.toml"), text);
 }
 
-// The status hc shows for the session, in Skelcrew's words.
-async function statusOf(session: string) {
-  return (await host.list()).sessions.find((s) => s.session === session)?.status;
+// The state hc shows for the session, such as `done` for Skelcrew's ready, or null for none.
+async function statusOf(id: string) {
+  const record = (await rpc("terminal.get", { terminal: id })) as { status?: { state: string } };
+  return record.status?.state ?? null;
+}
+
+// Presses keys in the session by hc's names, as a person's terminal would send them.
+const press = (id: string, keys: string[]) => rpc("terminal.keys", { terminal: id, keys });
+
+// Starts a session, remembering it for the end of the tests, and returns its ID.
+async function startSession(question: Parameters<typeof host.start>[0]) {
+  const { id } = await host.start(question);
+  started.push(id);
+  return id;
 }
 
 // Starts the fake agent in a session of its own and waits for its prompt.
-async function startAgent(labels: host.Labels = { repo: "simon/app", role: "builder" }) {
-  const session = `agent-${++names}`;
-  started.push(session);
-  await host.start({
-    session,
-    argv: [process.execPath, fakeAgent, "one arg", "two"],
+async function startAgent(labels: host.Labels = { repository: "simon/app", role: "builder" }) {
+  const session = await startSession({
+    name: "app-1",
+    command: [process.execPath, fakeAgent, "one arg", "two"],
     folder: join(scratch, "work"),
     env: {
       PATH: "/usr/bin:/bin",
@@ -94,14 +102,14 @@ async function startAgent(labels: host.Labels = { repo: "simon/app", role: "buil
 async function screenShows(session: string, text: string, timeout = 5000) {
   const deadline = Date.now() + timeout;
   while (true) {
-    const { text: shown } = await host.read({ session, lines: 0 });
+    const { screen: shown } = await host.read({ id: session });
     if (shown.includes(text)) return shown;
     if (Date.now() > deadline) throw new Error(`${session} never showed ${text}:\n${shown}`);
     await Bun.sleep(50);
   }
 }
 
-const screen = async (session: string) => (await host.read({ session, lines: 0 })).text;
+const screen = async (id: string) => (await host.read({ id })).screen;
 
 // Attaches a person's terminal to the session, through `script`, which gives hc attach the
 // terminal it needs, and returns once hc painted the screen, with a way to type and to detach.
@@ -110,7 +118,7 @@ async function attachPerson(
   session: string,
   env: Record<string, string | undefined> = process.env,
 ) {
-  const { argv: attach } = await host.attach({ session });
+  const attach = await host.attachCommand(session);
   const quoted = attach.map((word) => `'${word.replaceAll("'", "'\\''")}'`).join(" ");
   const argv =
     process.platform === "darwin"
@@ -147,7 +155,7 @@ async function attachPerson(
 }
 
 describe.skipIf(!bin)("sessions on herdr-core", () => {
-  test("start runs exactly the argv, folder and environment given", async () => {
+  test("start runs exactly the command, folder and environment given", async () => {
     const session = await startAgent();
     const shown = await screen(session);
     expect(shown).toContain(`argv: ${JSON.stringify(["one arg", "two"])}`);
@@ -161,144 +169,101 @@ describe.skipIf(!bin)("sessions on herdr-core", () => {
   }, 15_000);
 
   test("start sets an environment name that starts with -, rather than reading it as an option", async () => {
-    const session = "dash-env";
-    started.push(session);
-    await host.start({
-      session,
-      argv: [process.execPath, fakeAgent],
+    const session = await startSession({
+      name: "dash-env",
+      command: [process.execPath, fakeAgent],
       folder: scratch,
       env: { PATH: "/usr/bin:/bin", "-FOO": "bar" },
-      labels: { repo: "simon/app", role: "builder" },
+      labels: { repository: "simon/app", role: "builder" },
     });
     const shown = await screenShows(session, "token:");
     expect(shown).toContain(`env: ${JSON.stringify(["-FOO", "PATH"])}`);
   }, 15_000);
 
-  test("list finds Skelcrew's sessions with their labels, and not others", async () => {
-    const lead = await startAgent({ repo: "simon/app", role: "lead" });
-    const builder = await startAgent({ repo: "simon/app", role: "builder", task: "app-12" });
-    const notOurs = { argv: ["sleep", "30"], name: "not-ours", labels: { repo: "x/y" } };
-    await rpc("terminal.run", { ...notOurs, no_parent: true });
-    started.push("not-ours");
-    const { sessions } = await host.list();
-    expect(sessions).toContainEqual({
-      session: lead,
-      running: true,
-      labels: { repo: "simon/app", role: "lead" },
-      status: null,
-    });
-    expect(sessions).toContainEqual({
-      session: builder,
-      running: true,
-      labels: { repo: "simon/app", role: "builder", task: "app-12" },
-      status: null,
-    });
-    expect(sessions.map((s) => s.session)).not.toContain("not-ours");
+  test("start takes any name Skelcrew gives, and each start is a session of its own", async () => {
+    const exits = {
+      name: "My.App-12",
+      command: ["sleep", "30"],
+      folder: scratch,
+      env: {},
+      labels: { repository: "simon/My.App", role: "builder" as const, task: "My.App-12" },
+    };
+    const first = await startSession(exits);
+    const second = await startSession(exits);
+    expect(first).not.toBe(second);
+    const record = (await rpc("terminal.get", { terminal: first })) as { labels: unknown };
+    expect(record.labels).toMatchObject({ repo: "simon/My.App", name: "My.App-12" });
   }, 15_000);
 
-  test("read gives the screen, and history above it", async () => {
+  test("list finds Skelcrew's sessions with their labels, and not others", async () => {
+    const lead = await startAgent({ repository: "simon/app", role: "lead" });
+    const builder = await startAgent({ repository: "simon/app", role: "builder", task: "app-12" });
+    const notOurs = { argv: ["sleep", "30"], labels: { repo: "x/y" }, no_parent: true };
+    const other = (await rpc("terminal.run", notOurs)) as { address: string };
+    started.push(other.address);
+    const { sessions } = await host.list();
+    expect(sessions).toContainEqual({
+      id: lead,
+      running: true,
+      labels: { repository: "simon/app", role: "lead" },
+    });
+    expect(sessions).toContainEqual({
+      id: builder,
+      running: true,
+      labels: { repository: "simon/app", role: "builder", task: "app-12" },
+    });
+    expect(sessions.map((s) => s.id)).not.toContain(other.address);
+  }, 15_000);
+
+  test("read gives the screen", async () => {
     const session = await startAgent();
-    await host.keys({ session, keys: ["h", "i", "enter"] });
+    await press(session, ["h", "i", "enter"]);
     await screenShows(session, "got: hi");
-    const { text } = await host.read({ session, lines: 100 });
-    expect(text).toContain("argv:");
-    expect(text).toContain("got: hi");
+    expect(await screen(session)).toContain("argv:");
+  }, 15_000);
+
+  test("keys presses Enter and Esc", async () => {
+    const session = await startAgent();
+    await press(session, ["h", "i"]);
+    await host.keys({ id: session, key: "Enter" });
+    await screenShows(session, "got: hi");
+    await host.keys({ id: session, key: "Escape" });
+    await screenShows(session, "interrupted");
   }, 15_000);
 
   test("end ends the agent and removes its session, and ending it again is no error", async () => {
     const session = await startAgent();
-    await host.end({ session });
-    expect((await host.list()).sessions.map((s) => s.session)).not.toContain(session);
-    await host.end({ session });
+    await host.end({ id: session });
+    expect((await host.list()).sessions.map((s) => s.id)).not.toContain(session);
+    await host.end({ id: session });
   }, 15_000);
 
-  test("an agent that exits stays listed, not running, with how it ended", async () => {
-    const session = "exits";
-    started.push(session);
-    await host.start({
-      session,
-      argv: ["/bin/sh", "-c", "exit 3"],
+  test("an agent that exits stays listed, not running, with its last screen", async () => {
+    const session = await startSession({
+      name: "exits",
+      command: ["/bin/sh", "-c", "echo bye; exit 3"],
       folder: scratch,
       env: {},
-      labels: { repo: "simon/app", role: "builder", task: "app-9" },
+      labels: { repository: "simon/app", role: "builder", task: "app-9" },
     });
     let found: Awaited<ReturnType<typeof host.list>>["sessions"][number] | undefined;
-    for (let i = 0; i < 100 && !found?.ended; i++, await Bun.sleep(50))
-      found = (await host.list()).sessions.find((s) => s.session === session);
+    for (let i = 0; i < 100 && found?.running !== false; i++, await Bun.sleep(50))
+      found = (await host.list()).sessions.find((s) => s.id === session);
     expect(found?.running).toBe(false);
-    expect<unknown>(found?.ended).toEqual({ reason: "exited", exit_code: 3 });
+    expect(await screen(session)).toContain("bye");
   }, 15_000);
 
-  test("starts under one name at once give one session", async () => {
-    const session = "racing";
-    started.push(session);
-    const exits = {
-      session,
-      argv: ["/bin/true"],
-      folder: scratch,
-      env: {},
-      labels: { repo: "simon/app", role: "builder" as const },
-    };
-    // One caller whose every hc call takes two seconds more, so another starts between its look
-    // at the kept names and its own start, and that one's agent has already exited by then.
-    const slow = join(scratch, "slow-start-hc");
-    writeFileSync(slow, `#!/bin/sh\n[ "$1" = server ] && sleep 2\nexec '${bin}' "$@"\n`);
-    chmodSync(slow, 0o755);
-    const first = Bun.spawn(["bun", join(import.meta.dir, "..", "src", "call.ts")], {
-      env: { ...process.env, HC_BIN: slow },
-      stdin: new Blob([JSON.stringify({ ask: "start", ...exits })]),
-      stdout: "ignore",
-      stderr: "ignore",
-    });
-    await Bun.sleep(3000);
-    const second = await host.start(exits).then(
-      () => true,
-      () => false,
-    );
-    const firstStarted = (await first.exited) === 0;
-    expect([firstStarted, second].filter(Boolean)).toHaveLength(1);
-    const named = (await host.list()).sessions.filter((s) => s.session === session);
-    expect(named).toHaveLength(1);
-  }, 30_000);
-
-  test("a name stays one session's until end removes it, even after its agent exits", async () => {
-    const session = "reused";
-    started.push(session);
-    const exits = {
-      session,
-      argv: ["/bin/sh", "-c", "exit 0"],
-      folder: scratch,
-      env: {},
-      labels: { repo: "simon/app", role: "builder" as const },
-    };
-    await host.start(exits);
-    for (let i = 0; i < 100; i++, await Bun.sleep(50)) {
-      const found = (await host.list()).sessions.find((s) => s.session === session);
-      if (found && !found.running) break;
-    }
-    await expect(host.start({ ...exits, argv: ["sleep", "30"] })).rejects.toThrow("still kept");
-    const named = (await host.list()).sessions.filter((s) => s.session === session);
-    expect(named).toHaveLength(1);
-    expect(named[0]?.running).toBe(false);
-    await host.end({ session });
-    await host.start({ ...exits, argv: ["sleep", "30"] });
-    const again = (await host.list()).sessions.filter((s) => s.session === session);
-    expect(again.map((s) => s.running)).toEqual([true]);
-  }, 20_000);
-
   test("attach is hc attach on the session, on Skelcrew's core whatever the caller's env", async () => {
-    expect(await host.attach({ session: "agent-1" })).toEqual({
-      argv: [
-        "/usr/bin/env",
-        ...["-u", "HC_TERMINAL_ID", "-u", "HC_SCOPE"],
-        `HC_SOCKET=${join(sockets, "herdr-core", `${process.env.SKELCREW_HC_SESSION}.sock`)}`,
-        `HC_SESSION=${process.env.SKELCREW_HC_SESSION}`,
-        `XDG_CONFIG_HOME=${join(scratch, "plugin", "config")}`,
-        bin ?? "",
-        "attach",
-        "agent-1",
-      ],
-    });
+    expect(await host.attachCommand("t1")).toEqual([
+      "/usr/bin/env",
+      ...["-u", "HC_TERMINAL_ID", "-u", "HC_SCOPE"],
+      `HC_SOCKET=${join(sockets, "herdr-core", `${process.env.SKELCREW_HC_SESSION}.sock`)}`,
+      `HC_SESSION=${process.env.SKELCREW_HC_SESSION}`,
+      `XDG_CONFIG_HOME=${join(scratch, "plugin", "config")}`,
+      bin ?? "",
+      "attach",
+      "t1",
+    ]);
     // A person's terminal with other runtime and state folders, a socket override and another
     // session still reaches Skelcrew's core.
     const session = await startAgent();
@@ -333,76 +298,68 @@ describe.skipIf(!bin)("status on herdr-core", () => {
       ["error", "unknown model", { state: "error", msg: "unknown model" }],
     ] as const;
     for (const [word, reason, osc] of shows) {
-      expect(await host.status({ session, status: word, reason })).toEqual({ status: word });
+      expect(await host.status({ id: session, status: word, reason })).toEqual({ status: word });
       const record = (await rpc("terminal.get", { terminal: session })) as { status: unknown };
       expect(record.status).toEqual(osc);
-      const listed = (await host.list()).sessions.find((s) => s.session === session);
-      expect(listed?.status).toBe(word);
     }
     // The report reached hc, not the agent's screen.
     expect(await screen(session)).not.toContain("7501");
   }, 20_000);
 
   test("a status for a session that has ended is an error", async () => {
-    await expect(host.status({ session: "nobody", status: "idle", reason: "" })).rejects.toThrow();
+    await expect(host.status({ id: "nobody", status: "idle", reason: "" })).rejects.toThrow();
   });
 });
 
 describe.skipIf(!bin)("transport on herdr-core", () => {
   test("deliver types only once the agent is idle", async () => {
     const session = await startAgent();
-    await host.status({ session, status: "working", reason: "" });
-    expect(await host.deliver({ session, text: "too soon", marks, timeout: 0.5 })).toEqual({
-      delivered: false,
-      why: "it was working",
-    });
-    const delivery = host.deliver({ session, text: "now", marks, timeout: 10 });
+    await host.status({ id: session, status: "working", reason: "" });
+    await expect(
+      host.deliver({ id: session, text: "too soon", marks, timeout: 500 }),
+    ).rejects.toThrow("it was working");
+    const delivery = host.deliver({ id: session, text: "now", marks, timeout: 10000 });
     await Bun.sleep(500);
     expect(await screen(session)).not.toContain("got:");
-    await host.status({ session, status: "idle", reason: "" });
-    expect(await delivery).toEqual({ delivered: true });
+    await host.status({ id: session, status: "idle", reason: "" });
+    expect(await delivery).toEqual({});
     const shown = await screenShows(session, "got: now");
     expect(shown).not.toContain("too soon");
   }, 20_000);
 
   test("deliver goes to a ready agent, but not into an open question", async () => {
     const session = await startAgent();
-    await host.status({ session, status: "ready", reason: "" });
-    expect(await host.deliver({ session, text: "review", marks, timeout: 5 })).toEqual({
-      delivered: true,
-    });
+    await host.status({ id: session, status: "ready", reason: "" });
+    expect(await host.deliver({ id: session, text: "review", marks, timeout: 5000 })).toEqual({});
     await screenShows(session, "got: review");
-    await host.status({ session, status: "needs you", reason: "question" });
-    expect(await host.deliver({ session, text: "yes", marks, timeout: 1 })).toMatchObject({
-      delivered: false,
-    });
-    await host.status({ session, status: "needs you", reason: "round limit" });
-    expect(await host.deliver({ session, text: "go on", marks, timeout: 5 })).toEqual({
-      delivered: true,
-    });
+    await host.status({ id: session, status: "needs you", reason: "question" });
+    await expect(
+      host.deliver({ id: session, text: "yes", marks, timeout: 1000 }),
+    ).rejects.toThrow();
+    await host.status({ id: session, status: "needs you", reason: "round limit" });
+    expect(await host.deliver({ id: session, text: "go on", marks, timeout: 5000 })).toEqual({});
     await screenShows(session, "got: go on");
     expect(await screen(session)).not.toContain("got: yes");
   }, 20_000);
 
   test("a person's unsent draft holds a delivery until it is sent or cleared", async () => {
     const session = await startAgent();
-    await host.status({ session, status: "idle", reason: "" });
+    await host.status({ id: session, status: "idle", reason: "" });
     const person = await attachPerson(session);
     try {
       person.type("draft");
       await screenShows(session, "> draft");
-      expect(await host.deliver({ session, text: "held", marks, timeout: 1.5 })).toEqual({
-        delivered: false,
-        why: draftReason,
-      });
+      await expect(
+        host.deliver({ id: session, text: "held", marks, timeout: 1500 }),
+      ).rejects.toThrow(draftReason);
       // The send that timed out is gone: nothing is typed later either.
       await Bun.sleep(1000);
       expect(await screen(session)).not.toContain("held");
-      const delivery = host.deliver({ session, text: "after", marks, timeout: 10 });
+      const delivery = host.deliver({ id: session, text: "after", marks, timeout: 10000 });
       await Bun.sleep(500);
       expect(await screen(session)).not.toContain("after");
       person.type("\x15"); // ctrl+u clears the draft
-      expect(await delivery).toEqual({ delivered: true });
+      expect(await delivery).toEqual({});
       const shown = await screenShows(session, "got: after");
       expect(shown).not.toContain("draftafter");
     } finally {
@@ -415,29 +372,28 @@ describe.skipIf(!bin)("transport on herdr-core", () => {
     const person = await attachPerson(session);
     try {
       // A draft from before the delivery, and one typed while it waits for the agent.
-      await host.status({ session, status: "idle", reason: "" });
+      await host.status({ id: session, status: "idle", reason: "" });
       person.type("draft");
       await screenShows(session, "> draft");
       await Bun.sleep(1500);
-      expect(await host.deliver({ session, text: "AUTOMATED", marks, timeout: 2 })).toEqual({
-        delivered: false,
-        why: draftReason,
-      });
+      await expect(
+        host.deliver({ id: session, text: "AUTOMATED", marks, timeout: 2000 }),
+      ).rejects.toThrow(draftReason);
       person.type("\x15");
-      await host.status({ session, status: "working", reason: "" });
-      const delivery = host.deliver({ session, text: "LATER", marks, timeout: 3 });
+      await host.status({ id: session, status: "working", reason: "" });
+      const delivery = host.deliver({ id: session, text: "LATER", marks, timeout: 3000 });
       person.type("again");
       await screenShows(session, "> again");
-      await host.status({ session, status: "idle", reason: "" });
-      expect(await delivery).toEqual({ delivered: false, why: draftReason });
+      await host.status({ id: session, status: "idle", reason: "" });
+      await expect(delivery).rejects.toThrow(draftReason);
       await Bun.sleep(500);
       const shown = await screen(session);
       expect(shown).not.toContain("AUTOMATED");
       expect(shown).not.toContain("LATER");
       person.type("\x15");
-      expect(await host.deliver({ session, text: "cleared", marks, timeout: 5 })).toEqual({
-        delivered: true,
-      });
+      expect(await host.deliver({ id: session, text: "cleared", marks, timeout: 5000 })).toEqual(
+        {},
+      );
       await screenShows(session, "got: cleared");
     } finally {
       await person.detach();
@@ -446,7 +402,7 @@ describe.skipIf(!bin)("transport on herdr-core", () => {
 
   test("a draft the screen doesn't show holds a delivery however old it is", async () => {
     const session = await startAgent();
-    await host.status({ session, status: "idle", reason: "" });
+    await host.status({ id: session, status: "idle", reason: "" });
     const person = await attachPerson(session);
     // A person's own config can't shorten the hold on Skelcrew's core, however it is written.
     const configs = [
@@ -461,17 +417,16 @@ describe.skipIf(!bin)("transport on herdr-core", () => {
         person.type("\x02draft");
         await Bun.sleep(age);
         expect(host.notReady(await screen(session), marks)).toBe("");
-        expect(await host.deliver({ session, text: "ONTOP", marks, timeout: 1.5 })).toEqual({
-          delivered: false,
-          why: "a person's typing at its prompt held it",
-        });
+        await expect(
+          host.deliver({ id: session, text: "ONTOP", marks, timeout: 1500 }),
+        ).rejects.toThrow("a person's typing at its prompt held it");
         await Bun.sleep(500);
         expect(await screen(session)).not.toContain("ONTOP");
         person.type("\x15");
       }
-      expect(await host.deliver({ session, text: "cleared", marks, timeout: 5 })).toEqual({
-        delivered: true,
-      });
+      expect(await host.deliver({ id: session, text: "cleared", marks, timeout: 5000 })).toEqual(
+        {},
+      );
       const shown = await screenShows(session, "got: cleared");
       expect(shown).not.toContain("draftONTOP");
     } finally {
@@ -497,22 +452,22 @@ describe.skipIf(!bin)("transport on herdr-core", () => {
 
   test("a status that changes while hc holds a delivery stops it", async () => {
     const session = await startAgent();
-    await host.status({ session, status: "ready", reason: "" });
+    await host.status({ id: session, status: "ready", reason: "" });
     const person = await attachPerson(session);
     try {
       // A draft the screen doesn't show, so only hc holds the send for it.
       person.type("\x02draft");
       await Bun.sleep(300);
       expect(host.notReady(await screen(session), marks)).toBe("");
-      const delivery = host.deliver({ session, text: "DURING_WORK", marks, timeout: 10 });
+      const delivery = host.deliver({ id: session, text: "DURING_WORK", marks, timeout: 10000 });
       await Bun.sleep(1000);
-      await host.status({ session, status: "working", reason: "" });
+      await host.status({ id: session, status: "working", reason: "" });
       person.type("\x15");
       await Bun.sleep(1500);
       expect(await screen(session)).not.toContain("DURING_WORK");
       expect(await statusOf(session)).toBe("working");
-      await host.status({ session, status: "ready", reason: "" });
-      expect(await delivery).toEqual({ delivered: true });
+      await host.status({ id: session, status: "ready", reason: "" });
+      expect(await delivery).toEqual({});
       await screenShows(session, "got: DURING_WORK");
     } finally {
       await person.detach();
@@ -521,19 +476,19 @@ describe.skipIf(!bin)("transport on herdr-core", () => {
 
   test("a status that changes while a draft holds a delivery stops it", async () => {
     const session = await startAgent();
-    await host.status({ session, status: "ready", reason: "" });
+    await host.status({ id: session, status: "ready", reason: "" });
     const person = await attachPerson(session);
     try {
       person.type("draft");
       await screenShows(session, "> draft");
-      const delivery = host.deliver({ session, text: "DURING_WORK", marks, timeout: 10 });
+      const delivery = host.deliver({ id: session, text: "DURING_WORK", marks, timeout: 10000 });
       await Bun.sleep(300);
-      await host.status({ session, status: "working", reason: "" });
+      await host.status({ id: session, status: "working", reason: "" });
       person.type("\x15");
       await Bun.sleep(1500);
       expect(await screen(session)).not.toContain("DURING_WORK");
-      await host.status({ session, status: "ready", reason: "" });
-      expect(await delivery).toEqual({ delivered: true });
+      await host.status({ id: session, status: "ready", reason: "" });
+      expect(await delivery).toEqual({});
       await screenShows(session, "got: DURING_WORK");
     } finally {
       await person.detach();
@@ -542,78 +497,66 @@ describe.skipIf(!bin)("transport on herdr-core", () => {
 
   test("a delivery to a ready agent puts its status back", async () => {
     const session = await startAgent();
-    await host.status({ session, status: "ready", reason: "" });
-    expect(await host.deliver({ session, text: "one", marks, timeout: 5 })).toEqual({
-      delivered: true,
-    });
-    expect(await statusOf(session)).toBe("ready");
+    await host.status({ id: session, status: "ready", reason: "" });
+    expect(await host.deliver({ id: session, text: "one", marks, timeout: 5000 })).toEqual({});
+    expect(await statusOf(session)).toBe("done");
     const person = await attachPerson(session);
     try {
       person.type("draft");
       await screenShows(session, "> draft");
-      expect(await host.deliver({ session, text: "two", marks, timeout: 1 })).toMatchObject({
-        delivered: false,
-      });
-      expect(await statusOf(session)).toBe("ready");
+      await expect(
+        host.deliver({ id: session, text: "two", marks, timeout: 1000 }),
+      ).rejects.toThrow();
+      expect(await statusOf(session)).toBe("done");
     } finally {
       await person.detach();
     }
   }, 20_000);
 
   test("a delivery to an agent that ends right after taking it is still delivered", async () => {
-    const session = "takes-one";
-    started.push(session);
-    await host.start({
-      session,
-      argv: ["/bin/sh", "-c", 'printf "> "; read line; echo "got: $line"'],
+    const session = await startSession({
+      name: "takes-one",
+      command: ["/bin/sh", "-c", 'printf "> "; read line; echo "got: $line"'],
       folder: scratch,
       env: {},
-      labels: { repo: "simon/app", role: "builder" },
+      labels: { repository: "simon/app", role: "builder" },
     });
     await screenShows(session, ">");
-    await host.status({ session, status: "ready", reason: "" });
-    expect(await host.deliver({ session, text: "last", marks, timeout: 5 })).toEqual({
-      delivered: true,
-    });
-    const found = (await host.list()).sessions.find((s) => s.session === session);
+    await host.status({ id: session, status: "ready", reason: "" });
+    expect(await host.deliver({ id: session, text: "last", marks, timeout: 5000 })).toEqual({});
+    const found = (await host.list()).sessions.find((s) => s.id === session);
     expect(found?.running).toBe(false);
-    expect<unknown>(found?.ended).toEqual({ reason: "exited", exit_code: 0 });
   }, 15_000);
 
   test("a busy mark holds a delivery only while it moves", async () => {
     const session = await startAgent();
-    await host.status({ session, status: "idle", reason: "" });
+    await host.status({ id: session, status: "idle", reason: "" });
     // The agent quotes the busy mark, which then stands still in its output.
     expect(
-      await host.deliver({ session, text: "say esc to interrupt", marks, timeout: 5 }),
-    ).toEqual({ delivered: true });
+      await host.deliver({ id: session, text: "say esc to interrupt", marks, timeout: 5000 }),
+    ).toEqual({});
     await screenShows(session, "got: say esc to interrupt");
-    expect(await host.deliver({ session, text: "quoted", marks, timeout: 5 })).toEqual({
-      delivered: true,
-    });
+    expect(await host.deliver({ id: session, text: "quoted", marks, timeout: 5000 })).toEqual({});
     await screenShows(session, "got: quoted");
     // A busy line that moves, though hc's status says idle.
-    await host.keys({ session, keys: ["ctrl+t"] });
+    await press(session, ["ctrl+t"]);
     await screenShows(session, "(esc to interrupt)");
-    expect(await host.deliver({ session, text: "moving", marks, timeout: 4 })).toEqual({
-      delivered: false,
-      why: "it shows esc to interrupt",
-    });
-    await host.keys({ session, keys: ["ctrl+t"] });
-    expect(await host.deliver({ session, text: "stopped", marks, timeout: 5 })).toEqual({
-      delivered: true,
-    });
+    await expect(
+      host.deliver({ id: session, text: "moving", marks, timeout: 4000 }),
+    ).rejects.toThrow("it shows esc to interrupt");
+    await press(session, ["ctrl+t"]);
+    expect(await host.deliver({ id: session, text: "stopped", marks, timeout: 5000 })).toEqual({});
     const shown = await screenShows(session, "got: stopped");
     expect(shown).not.toContain("got: moving");
   }, 30_000);
 
   test("deliver types nothing once its time is up", async () => {
     const session = await startAgent();
-    await host.status({ session, status: "idle", reason: "" });
-    for (const timeout of [0, 0.3]) {
-      expect(await host.deliver({ session, text: "too late", marks, timeout })).toMatchObject({
-        delivered: false,
-      });
+    await host.status({ id: session, status: "idle", reason: "" });
+    for (const timeout of [0, 300]) {
+      await expect(
+        host.deliver({ id: session, text: "too late", marks, timeout }),
+      ).rejects.toThrow();
     }
     await Bun.sleep(1500);
     expect(await screen(session)).not.toContain("too late");
@@ -621,7 +564,7 @@ describe.skipIf(!bin)("transport on herdr-core", () => {
 
   test("a send whose setup outlasts its deadline is never sent", async () => {
     const session = await startAgent();
-    await host.status({ session, status: "idle", reason: "" });
+    await host.status({ id: session, status: "idle", reason: "" });
     // An hc whose core check takes two seconds, as on a slow or busy machine.
     const slow = join(scratch, "slow-hc");
     writeFileSync(slow, `#!/bin/sh\n[ "$1" = server ] && sleep 2\nexec '${bin}' "$@"\n`);
@@ -630,9 +573,9 @@ describe.skipIf(!bin)("transport on herdr-core", () => {
     try {
       const send = { terminal: session, text: "LATE", if: "idle" };
       await expect(rpc("terminal.send", send, Date.now() + 1000)).rejects.toThrow("time ran out");
-      expect(await host.deliver({ session, text: "LATER", marks, timeout: 1 })).toMatchObject({
-        delivered: false,
-      });
+      await expect(
+        host.deliver({ id: session, text: "LATER", marks, timeout: 1000 }),
+      ).rejects.toThrow();
     } finally {
       process.env.HC_BIN = bin ?? "";
     }
@@ -641,46 +584,37 @@ describe.skipIf(!bin)("transport on herdr-core", () => {
     expect(shown).not.toContain("LATE");
   }, 30_000);
 
-  test("idle says when the agent stops working", async () => {
+  test("idle says at once whether the agent can take a message", async () => {
     const session = await startAgent();
-    await host.status({ session, status: "working", reason: "" });
-    expect(await host.idle({ session, timeout: 0.3 })).toEqual({ idle: false, status: "working" });
-    const waiting = host.idle({ session, timeout: 10 });
-    await Bun.sleep(300);
-    await host.status({ session, status: "ready", reason: "" });
-    expect(await waiting).toEqual({ idle: true, status: "ready" });
-    await host.end({ session });
-    expect(await host.idle({ session, timeout: 1 })).toMatchObject({ idle: false, ended: true });
-  }, 20_000);
-
-  test("idle with no time to wait says what it sees, and never that a live session ended", async () => {
-    const session = await startAgent();
-    for (let i = 0; i < 3; i++)
-      expect(await host.idle({ session, timeout: 0 })).toEqual({ idle: false, status: null });
-    await host.status({ session, status: "working", reason: "" });
-    for (let i = 0; i < 3; i++)
-      expect(await host.idle({ session, timeout: 0 })).toEqual({ idle: false, status: "working" });
-    await host.status({ session, status: "idle", reason: "" });
-    for (let i = 0; i < 3; i++)
-      expect(await host.idle({ session, timeout: 0 })).toEqual({ idle: true, status: "idle" });
-    expect(await host.idle({ session: "nobody", timeout: 0 })).toEqual({
-      idle: false,
-      status: null,
-      ended: true,
-    });
+    // Nothing reported yet, then a turn running, then each status that leaves it free.
+    expect(await host.idle({ id: session })).toEqual({ idle: false });
+    const says = [
+      ["working", "", false],
+      ["idle", "", true],
+      ["ready", "", true],
+      ["error", "unknown model", true],
+      ["needs you", "round limit", true],
+      ["needs you", "question", false],
+    ] as const;
+    for (const [word, reason, free] of says) {
+      await host.status({ id: session, status: word, reason });
+      expect(await host.idle({ id: session })).toEqual({ idle: free });
+    }
+    await host.end({ id: session });
+    expect(await host.idle({ id: session })).toEqual({ idle: false });
   }, 20_000);
 
   test("interrupt presses Esc, and the status stays Skelcrew's to change", async () => {
     const session = await startAgent();
-    await host.status({ session, status: "working", reason: "" });
-    expect(await host.interrupt({ session, timeout: 0.5 })).toEqual({
+    await host.status({ id: session, status: "working", reason: "" });
+    expect(await host.interrupt({ id: session })).toEqual({
       key: "esc",
       outcome: "still_working",
     });
     await screenShows(session, "interrupted");
-    const stopped = host.interrupt({ session, timeout: 5 });
+    const stopped = host.interrupt({ id: session });
     await Bun.sleep(200);
-    await host.status({ session, status: "idle", reason: "" });
+    await host.status({ id: session, status: "idle", reason: "" });
     expect(await stopped).toEqual({ key: "esc", outcome: "stopped" });
   }, 20_000);
 });
@@ -701,19 +635,34 @@ describe.skipIf(!bin)("the call handler", () => {
   test("refuses a question it can't read, with the reason on stderr", async () => {
     const child = Bun.spawn(["bun", join(import.meta.dir, "..", "src", "call.ts")], {
       env: process.env,
-      stdin: new Blob([JSON.stringify({ ask: "start", session: "Bad Name" })]),
+      stdin: new Blob([JSON.stringify({ ask: "read", id: "Bad Name" })]),
       stdout: "pipe",
       stderr: "pipe",
     });
     const err = await new Response(child.stderr).text();
     expect(await child.exited).toBe(1);
-    expect(err).toContain("session");
+    expect(err).toContain("id");
   });
 
+  // Skelcrew takes a delivery that answered for one that went in, so one that didn't must fail.
+  test("a delivery that didn't go in exits 1 with why", async () => {
+    const session = await startAgent();
+    await host.status({ id: session, status: "working", reason: "" });
+    const question = { ask: "deliver", id: session, text: "NOT_NOW", timeout: 300 };
+    const child = Bun.spawn(["bun", join(import.meta.dir, "..", "src", "call.ts")], {
+      env: process.env,
+      stdin: new Blob([JSON.stringify(question)]),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const err = await new Response(child.stderr).text();
+    expect(await child.exited).toBe(1);
+    expect(err.trim().split("\n").at(-1)).toBe("Error: it was working");
+    expect(await screen(session)).not.toContain("NOT_NOW");
+  }, 15_000);
+
   test("calls the same functions", async () => {
-    expect(await answer({ ask: "attach", session: "x" })).toEqual(
-      await host.attach({ session: "x" }),
-    );
+    expect(await answer({ ask: "idle", id: "t999" })).toEqual(await host.idle({ id: "t999" }));
   });
 });
 
@@ -741,7 +690,7 @@ describe.skipIf(!bin)("a session's lock", () => {
     // Another caller, as Skelcrew's engine might be, with another inherited HC_SESSION and TMPDIR.
     const env = { ...process.env, HC_SESSION: "inherited", TMPDIR: join(scratch, "elsewhere") };
     mkdirSync(env.TMPDIR, { recursive: true });
-    const question = { ask: "status", session, status: "working", reason: "" };
+    const question = { ask: "status", id: session, status: "working", reason: "" };
     const caller = Bun.spawn(["bun", join(import.meta.dir, "..", "src", "call.ts")], {
       env,
       stdin: new Blob([JSON.stringify(question)]),
@@ -761,17 +710,9 @@ describe.skipIf(!bin)("a session's lock", () => {
   }, 20_000);
 
   test("stays its live holder's however long it is held", async () => {
-    const session = "held-long";
-    started.push(session);
+    const session = await startAgent();
     const holder = await holdLockElsewhere(session);
-    const question = {
-      ask: "start",
-      session,
-      argv: ["sleep", "30"],
-      folder: scratch,
-      env: {},
-      labels: { repo: "simon/app", role: "builder" },
-    };
+    const question = { ask: "status", id: session, status: "working", reason: "" };
     const caller = Bun.spawn(["bun", join(import.meta.dir, "..", "src", "call.ts")], {
       env: process.env,
       stdin: new Blob([JSON.stringify(question)]),
@@ -782,12 +723,12 @@ describe.skipIf(!bin)("a session's lock", () => {
       // Longer than any age a lock could once be taken for.
       await Bun.sleep(11_000);
       expect(caller.exitCode).toBeNull();
-      expect((await host.list()).sessions.map((s) => s.session)).not.toContain(session);
+      expect(await statusOf(session)).toBeNull();
     } finally {
       holder.kill();
     }
     expect(await caller.exited).toBe(0);
-    expect((await host.list()).sessions.map((s) => s.session)).toContain(session);
+    expect(await statusOf(session)).toBe("working");
   }, 30_000);
 
   test("goes to one waiter at a time once its holder dies, and is left free", async () => {
@@ -880,12 +821,8 @@ describe.skipIf(!bin)("Skelcrew's core", () => {
     Bun.spawnSync([bin ?? "hc", "server", "start", "--json"], { env, stdout: "ignore" });
     try {
       await expect(host.list()).rejects.toThrow("wasn't started by skelcrew-herdr");
-      await expect(host.idle({ session: "agent-1", timeout: 1 })).rejects.toThrow(
-        "wasn't started by skelcrew-herdr",
-      );
-      await expect(host.attach({ session: "agent-1" })).rejects.toThrow(
-        "wasn't started by skelcrew-herdr",
-      );
+      await expect(host.idle({ id: "t1" })).rejects.toThrow("wasn't started by skelcrew-herdr");
+      await expect(host.attachCommand("t1")).rejects.toThrow("wasn't started by skelcrew-herdr");
     } finally {
       Bun.spawnSync([bin ?? "hc", "server", "stop", "--json"], { env, stdout: "ignore" });
     }
