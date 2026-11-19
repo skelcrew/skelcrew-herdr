@@ -151,6 +151,7 @@ async function attachPerson(
       person.kill();
       await person.exited;
     },
+    exited: person.exited,
   };
 }
 
@@ -259,6 +260,24 @@ describe.skipIf(!bin)("sessions on herdr-core", () => {
     const record = (await rpc("terminal.get", { terminal: session })) as { exit_code: unknown };
     expect(record.exit_code).toBe(3);
   }, 15_000);
+
+  // Ctrl-Q detaches on tmux too, so leaving an agent is the same keys on either host. Alt-Q
+  // can't be: hc's detach key is a Ctrl chord.
+  test("Ctrl-Q detaches a person's terminal, and the agent keeps running", async () => {
+    const session = await startAgent();
+    const person = await attachPerson(session);
+    try {
+      person.type("\x11");
+      const left = await Promise.race([
+        person.exited.then(() => true),
+        Bun.sleep(3000).then(() => false),
+      ]);
+      expect(left).toBe(true);
+      expect((await host.list()).sessions.find((s) => s.id === session)?.running).toBe(true);
+    } finally {
+      await person.detach();
+    }
+  }, 20_000);
 
   test("attach is hc attach on the session, on Skelcrew's core whatever the caller's env", async () => {
     expect(await host.attachCommand("t1")).toEqual([

@@ -11,7 +11,7 @@ curl -fsSL https://releases.herdr.dev/core/install.sh | HC_INSTALL_DIR=~/.local/
 sc plugin install skelcrew/skelcrew-herdr
 ```
 
-Then set `session: herdr` in `~/.config/skelcrew/config.yaml`. New builders start on herdr. Builders already running stay on tmux until they end. In `sc --list`, Enter on a builder attaches to it full screen, and Ctrl+\ brings you back.
+Then set `session: herdr` in `~/.config/skelcrew/config.yaml`. New builders start on herdr. Builders already running stay on tmux until they end. In `sc --list`, Enter on a builder attaches to it full screen, and Ctrl-Q brings you back. Alt-Q, which also leaves a tmux session, doesn't work here.
 
 ## How Skelcrew calls it
 
@@ -47,7 +47,7 @@ hc is found as `HC_BIN`, or `hc` on `PATH`. `HC_TERMINAL_ID` and `HC_SCOPE` are 
 
 The agents run on an hc core of their own, the hc session `skelcrew` (`SKELCREW_HC_SESSION` changes it), the way they run on Skelcrew's own tmux server today.
 
-- **Its own config.** That core reads a config file this program writes and owns, in `$XDG_STATE_HOME/skelcrew-herdr/config/herdr-core/config.toml` (`SKELCREW_HERDR_HOME` moves the folder). It sets `notes = false` and `draft_wait = 1000000000`: a person's draft holds a send for over 31 years after their last key. It never reads the person's own `config.toml`, so nothing there can shorten the hold or have a different meaning.
+- **Its own config.** That core reads a config file this program writes and owns, in `$XDG_STATE_HOME/skelcrew-herdr/config/herdr-core/config.toml` (`SKELCREW_HERDR_HOME` moves the folder). It sets `notes = false`, `detach_key = "ctrl+q"` and `draft_wait = 1000000000`: a person's draft holds a send for over 31 years after their last key. It never reads the person's own `config.toml`, so nothing there can shorten the hold or have a different meaning.
 - **Started and checked on every call.** Every call first runs `hc server start` on that session, with that config folder and only the environment a core needs. If a core is already running, that does nothing. The call itself then goes over `hc connect`. On that connection, `server.status` first gives the core's pid, and the call is sent only if that process's environment shows it was started by this program on that config. The core is started with `SKELCREW_HERDR_CORE` set to a hash of its config folder. On Linux, `/proc` gives each variable whole, so both that mark and `XDG_CONFIG_HOME` are compared. On a Mac, `ps -E` prints the environment with spaces between values, which a folder's name could hold too, so only the mark, which has no spaces, is looked for there. A connection reaches one core, so the call can only reach the core that was checked. Nothing is cached between calls, so a core stopped and replaced in between is found. A core started any other way is refused, with an error saying how to stop it. That includes one started by any hc command run on that session, which starts a core on the person's config if none runs.
 - **Reaching it.** Every call here runs with `HC_SESSION` and `XDG_CONFIG_HOME` set to Skelcrew's, and without `HC_SOCKET`. `attach` answers a command that names the core's own socket (`HC_SOCKET`, found as hc finds it, and checked to exist), so it reaches the same core whatever the caller's environment holds, other runtime and state folders included.
 - **For herdr's apps.** To show Skelcrew's agents, they must look at that session.
@@ -99,7 +99,7 @@ Tested with hc 0.1.21.
 - **An environment of exactly what is given.** Every terminal gets the core's environment, and `terminal.run`'s `env` only adds to it. So `start` runs the command under `/usr/bin/env -i --`, with exactly the variables given (`--` keeps a name starting with `-` from being read as an option), terminal ones included. hc's own `TERM`, `COLORTERM` and `TERM_PROGRAM` (`xterm-256color`, `truecolor`, `ghostty`) reach the agent only when Skelcrew passes them. On tmux, Skelcrew keeps the pane's `TERM` and `TERM_PROGRAM` instead, so on hc it should pass the ones it wants.
 - **Status of its own.** hc never infers status from the screen. Its status is only what was written to the terminal as OSC 7501. Here that is whatever Skelcrew reports, so hc's idle is Skelcrew's idle passed back: `deliver` and `idle` depend on `status` being called on every change.
 - **A paste without Enter.** `send` is always paste then Enter. That covers `deliver`, but not the `paste` that the v6 sessions table lists for the built-in transport. That transport isn't needed on hc, since hc's own is better, so this plugin has no `paste`.
-- **Skelcrew's detach key.** `hc attach` detaches with Ctrl+\, not Alt-Q.
+- **Skelcrew's detach key.** `hc attach` detaches only with a Ctrl chord, Ctrl+\ by default. Skelcrew's core sets `detach_key = "ctrl+q"`, which tmux sessions also take, but Alt-Q can't work.
 - **A core that is safe whoever starts it.** The first hc command starts a core if none runs, with that command's environment and config, and the core passes its environment to every terminal. That is why this program starts Skelcrew's core itself and refuses one started otherwise.
 
 ## How status reaches herdr
