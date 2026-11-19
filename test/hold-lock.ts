@@ -1,4 +1,4 @@
-// Holds a session's lock, as a caller in the middle of a report or a start does, until it is
+// Holds a session's lock, as a caller in the middle of a status report does, until it is
 // killed. Says `held` once it has it. The session is its argument.
 import { locked } from "../src/host.ts";
 

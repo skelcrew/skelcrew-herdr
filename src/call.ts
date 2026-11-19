@@ -1,6 +1,7 @@
-// The call handler: one JSON question on stdin, one JSON answer on stdout, as Skelcrew asks its
-// plugins today. The question's `ask` names the function, and the rest are its arguments. An
-// error exits 1 with its message as the last line of stderr, as Skelcrew reads it.
+// The session command Skelcrew runs for its runtime plugins: one JSON question on stdin, one JSON
+// answer on stdout. The question's `ask` names the function, and the rest are its arguments. An
+// error exits 1 with its message as the last line of stderr, as Skelcrew reads it. `paste` isn't
+// answered: it serves only Skelcrew's built-in transport, which this plugin's own replaces.
 import { z } from "zod";
 import * as host from "./host.ts";
 
@@ -11,7 +12,6 @@ const Question = z.discriminatedUnion("ask", [
   host.Keys.extend({ ask: z.literal("keys") }),
   host.Interrupt.extend({ ask: z.literal("interrupt") }),
   host.End.extend({ ask: z.literal("end") }),
-  host.Attach.extend({ ask: z.literal("attach") }),
   host.Deliver.extend({ ask: z.literal("deliver") }),
   host.Idle.extend({ ask: z.literal("idle") }),
   host.Status.extend({ ask: z.literal("status") }),
@@ -34,8 +34,6 @@ export async function answer(question: unknown): Promise<unknown> {
       return host.interrupt(q);
     case "end":
       return host.end(q);
-    case "attach":
-      return host.attach(q);
     case "deliver":
       return host.deliver(q);
     case "idle":
