@@ -4,16 +4,39 @@
 // untouched, and writes OSC 7501 into that terminal whenever `status` hands it one over its
 // socket. It runs outside the sandbox, as the plugin does.
 //
-// Usage: SKELCREW_AGENT_ENV=<json> bun src/relay.ts <socket> -- <command...>
-import { rmSync, writeSync } from "node:fs";
-import { constants } from "node:os";
-import { basename } from "node:path";
+// Usage: SKELCREW_AGENT_ENV=<json> [SKELCREW_FILES_MARK=<marker>] bun src/relay.ts <socket> -- <command...>
+import { mkdirSync, rmSync, writeSync } from "node:fs";
+import { constants, homedir } from "node:os";
+import { basename, join } from "node:path";
 import { z } from "zod";
 
-const [socket, dashes, ...command] = process.argv.slice(2);
-if (!socket || dashes !== "--" || command.length === 0) {
+const [socket, dashes, ...given] = process.argv.slice(2);
+if (!socket || dashes !== "--" || given.length === 0) {
   process.stderr.write("usage: relay.ts <socket> -- <command...>\n");
   process.exit(2);
+}
+
+// The folder where hc puts the files a person drops into this terminal, such as a screenshot:
+// `files/<address>` in the core's state folder, as hc 0.1.21 names it. The relay runs with the
+// core's own environment, so its state folder and session are the core's, and its address is the
+// terminal's. hc makes the folder only at the first drop, and removes it with the terminal.
+function filesFolder(): string {
+  const { HC_TERMINAL_ID: id, HC_SESSION: session, XDG_STATE_HOME: state } = process.env;
+  if (!id || !/^[a-z0-9_-]{1,32}$/.test(id))
+    throw new Error("the relay runs outside an hc terminal, so it has no files folder");
+  const folder = state || join(homedir(), ".local", "state");
+  return join(folder, "herdr-core", session || "default", "files", id);
+}
+
+// The sandbox's command shows the session's files folder where Skelcrew put the marker (see
+// `Start` in host.ts). The folder is made now, empty and only its owner's, so the sandbox has one
+// to show before anything is dropped.
+const mark = process.env.SKELCREW_FILES_MARK;
+let command = given;
+if (mark) {
+  const files = filesFolder();
+  mkdirSync(files, { recursive: true, mode: 0o700 });
+  command = given.map((word) => word.replaceAll(mark, files));
 }
 
 // The agent's whole environment, as JSON. It comes in the relay's own environment, never on its

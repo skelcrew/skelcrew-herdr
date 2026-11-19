@@ -2,9 +2,21 @@
 // config and socket folders, so the machine's own core and its terminals are never touched.
 // Without hc on PATH (or HC_BIN), they are skipped, and say so.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
+import { deflateSync } from "node:zlib";
 import { z } from "zod";
 import { answer } from "../src/call.ts";
 import { ensureCore, rpc, stopCore } from "../src/hc.ts";
@@ -1016,6 +1028,196 @@ describe.skipIf(!bin)("a session's lock", () => {
     await host.locked(session, async () => {});
     expect(Date.now() - started).toBeLessThan(1000);
   }, 20_000);
+});
+
+// A small screenshot an image viewer opens: a `width` by `height` PNG, 8-bit RGB, with a
+// gradient, each chunk with its CRC and the pixels deflated as the format requires.
+function validPng(width: number, height: number) {
+  const crcTable = Array.from({ length: 256 }, (_, n) => {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    return c >>> 0;
+  });
+  const crc = (bytes: Uint8Array) => {
+    let c = 0xffffffff;
+    for (const byte of bytes) c = (crcTable[(c ^ byte) & 0xff] ?? 0) ^ (c >>> 8);
+    return (c ^ 0xffffffff) >>> 0;
+  };
+  const chunk = (type: string, data: Uint8Array) => {
+    const out = Buffer.alloc(12 + data.length);
+    out.writeUInt32BE(data.length, 0);
+    out.write(type, 4, "latin1");
+    out.set(data, 8);
+    out.writeUInt32BE(crc(out.subarray(4, 8 + data.length)), 8 + data.length);
+    return out;
+  };
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(width, 0);
+  header.writeUInt32BE(height, 4);
+  header.set([8, 2, 0, 0, 0], 8);
+  // Each row starts with filter type 0, then its pixels' red, green and blue.
+  const rows = Buffer.alloc(height * (1 + width * 3));
+  for (let y = 0; y < height; y++)
+    for (let x = 0; x < width; x++) rows.set([x * 4, y * 5, 128], y * (1 + width * 3) + 1 + x * 3);
+  const signature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  return new Uint8Array(
+    Buffer.concat([
+      signature,
+      chunk("IHDR", header),
+      chunk("IDAT", deflateSync(rows)),
+      chunk("IEND", new Uint8Array()),
+    ]),
+  );
+}
+
+// A small PDF a reader opens, showing `text` on one page: its cross-reference table gives each
+// object's true byte offset, as the format requires.
+function validPdf(text: string) {
+  const stream = `BT /F1 24 Tf 72 720 Td (${text}) Tj ET`;
+  const objects = [
+    "<< /Type /Catalog /Pages 2 0 R >>",
+    "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>",
+    `<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`,
+    "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+  ];
+  let body = "%PDF-1.4\n";
+  const offsets = objects.map((object, i) => {
+    const at = body.length;
+    body += `${i + 1} 0 obj\n${object}\nendobj\n`;
+    return at;
+  });
+  const xref = body.length;
+  body += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  for (const at of offsets) body += `${String(at).padStart(10, "0")} 00000 n \n`;
+  body += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
+  return new TextEncoder().encode(body);
+}
+
+// Files a person drops into a session in herdr: hc puts each in the terminal's own files folder
+// and types its path to the agent, so the agent's sandbox must show that folder, and no other.
+describe.skipIf(!bin)("files dropped into a session", () => {
+  // A drop as herdr's apps make it: the file's bytes, put beside the terminal.
+  const drop = async (id: string, name: string, bytes: Uint8Array) =>
+    z.object({ path: z.string(), bytes: z.number() }).parse(
+      await rpc("terminal.put", {
+        terminal: id,
+        name,
+        data: Buffer.from(bytes).toString("base64"),
+      }),
+    );
+  // The marker Skelcrew puts in the command where the session's files folder goes.
+  const marker = () => `/skelcrew-files-${randomBytes(16).toString("hex")}`;
+  // A small PDF and PNG, as a person drops them.
+  const pdf = validPdf("Dropped into a session");
+  const png = validPng(64, 48);
+
+  // Starts the fake agent with the marker in its command, as the sandbox's mount would hold it.
+  async function startWithFiles(name: string) {
+    const files = marker();
+    const session = await startSession({
+      name,
+      command: [process.execPath, fakeAgent, `--ro-bind=${files}`, `${files}/x`],
+      folder: scratch,
+      env: { PATH: "/usr/bin:/bin" },
+      labels: { repository: "simon/app", role: "builder" },
+      files,
+    });
+    const shown = await screenShows(session, "token:");
+    const argv = JSON.parse(shown.match(/argv: (\[.*\])/)?.[1] ?? "[]") as string[];
+    return { session, files, argv };
+  }
+
+  test("the command names the session's own files folder, made empty before anything is dropped", async () => {
+    const { session, files, argv } = await startWithFiles("drops-1");
+    const folder = argv[0]?.replace(/^--ro-bind=/, "") ?? "";
+    expect(argv).toEqual([`--ro-bind=${folder}`, `${folder}/x`]);
+    expect(argv.join(" ")).not.toContain(files);
+    expect(readdirSync(folder)).toEqual([]);
+    expect(statSync(folder).mode & 0o777).toBe(0o700);
+    // hc puts a drop there: a PDF whose name has spaces, its bytes as they were.
+    const put = await drop(session, "Quarterly report 2026.pdf", pdf);
+    expect(dirname(put.path)).toBe(folder);
+    expect(basename(put.path)).not.toContain(" ");
+    expect(new Uint8Array(readFileSync(put.path))).toEqual(pdf);
+    // And removes the folder with the session.
+    await host.end({ id: session });
+    expect(existsSync(folder)).toBe(false);
+  }, 15_000);
+
+  test("each session's drops land in its own folder, never another's", async () => {
+    const one = await startWithFiles("drops-2");
+    const two = await startWithFiles("drops-3");
+    const first = await drop(one.session, "Screenshot 2026-11-19 at 20.14.53.png", png);
+    const second = await drop(two.session, "Screenshot 2026-11-19 at 20.14.53.png", png);
+    expect(dirname(first.path)).not.toBe(dirname(second.path));
+    expect(readdirSync(dirname(first.path))).toEqual([basename(first.path)]);
+    expect(readdirSync(dirname(second.path))).toEqual([basename(second.path)]);
+  }, 15_000);
+
+  test("start refuses a marker that isn't Skelcrew's", async () => {
+    for (const files of ["/home", "/skelcrew-files-x", `/skelcrew-files-${"a".repeat(32)}/..`])
+      await expect(
+        answer({
+          ask: "start",
+          name: "app-1",
+          command: ["sleep", "30"],
+          folder: scratch,
+          env: {},
+          labels: { repository: "simon/app", role: "builder" },
+          files,
+        }),
+      ).rejects.toThrow();
+  });
+
+  // A sandbox that hides the core's state, as Skelcrew's hides the home folder that holds it,
+  // and shows the session's files folder read-only at the marker's place. bubblewrap needs
+  // namespaces a user may make, which some machines and CI runners don't allow.
+  const bwrap = Bun.which("bwrap");
+  const nests = !!bwrap && Bun.spawnSync([bwrap, "--ro-bind", "/", "/", "true"]).exitCode === 0;
+  test.skipIf(!nests)(
+    "a sandboxed agent reads its own drops, and sees no other session's",
+    async () => {
+      const other = await startWithFiles("drops-4");
+      const theirs = await drop(other.session, "theirs.png", png);
+      const files = marker();
+      const state = join(scratch, "state");
+      // The agent's side: it reads each file whose path is typed to it, as herdr types a drop's,
+      // whole, and shows its checksum, then tries the other session's folder and to write beside
+      // the drop. Each answer goes on a line of its own, numbered by the drop.
+      const script =
+        'echo ready; n=0; while read -r path; do n=$((n+1)); sum=$(sha256sum < "$path" | cut -c1-64) &&' +
+        ' echo "read $n: $sum"; ls "$1" >/dev/null 2>&1 || echo "hidden $n"; touch "$path.new" 2>/dev/null ||' +
+        ' echo "read-only $n"; done';
+      const session = await startSession({
+        name: "drops-5",
+        command: [
+          ...[bwrap ?? "bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc"],
+          ...["--tmpfs", state, "--ro-bind", files, files, "--", "sh", "-c", script, "sh"],
+          dirname(theirs.path),
+        ],
+        folder: scratch,
+        env: { PATH: "/usr/bin:/bin" },
+        labels: { repository: "simon/app", role: "builder" },
+        files,
+      });
+      await screenShows(session, "ready");
+      const sha = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
+      // A screenshot and a valid PDF, both with spaces in their names, as a person drops them.
+      const drops: [string, Uint8Array][] = [
+        ["My screenshot.png", png],
+        ["Quarterly report 2026.pdf", pdf],
+      ];
+      for (const [n, [name, bytes]] of drops.entries()) {
+        const ours = await drop(session, name, bytes);
+        await rpc("terminal.send", { terminal: session, text: ours.path });
+        const shown = await screenShows(session, `read-only ${n + 1}`);
+        expect(shown).toContain(`read ${n + 1}: ${sha(bytes)}`);
+        expect(shown).toContain(`hidden ${n + 1}`);
+      }
+    },
+    20_000,
+  );
 });
 
 test("fieldsFor encodes a status the way hc reads it", () => {

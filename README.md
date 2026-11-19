@@ -52,7 +52,7 @@ echo '{"ask":"list"}' | bun src/call.ts
 
 | `ask` | Takes | Answers | On hc |
 | --- | --- | --- | --- |
-| `start` | `name`, `command`, `folder`, `env`, `labels` (`repository`, `role`, `task`, and `title` for its tab) | `id`, the terminal's hc address, such as `t7` | `terminal.run` (`hc run --bg --no-parent --cwd --label`), with the environment handed to the relay |
+| `start` | `name`, `command`, `folder`, `env`, `labels` (`repository`, `role`, `task`, and `title` for its tab), and optionally `files`, the marker for the session's files folder (see below) | `id`, the terminal's hc address, such as `t7` | `terminal.run` (`hc run --bg --no-parent --cwd --label`), with the environment handed to the relay |
 | `list` | | `sessions`: each with `id`, `running` and `labels` | `terminal.list` with the `by=skelcrew` label |
 | `read` | `id` | `screen` | `terminal.read` (`hc read`) |
 | `keys` | `id`, `key`: `Enter` or `Escape` | | `terminal.keys` (`hc keys`) |
@@ -108,6 +108,7 @@ The installer doesn't start a core. The fake agent, `test/fake-agent.ts`, prints
 - `end`
 - the status hc shows after each report, through the relay, which refuses anything but a report
 - the agent's exit code passing through the relay, and `end` ending the agent under it
+- a dropped file, a PDF or a screenshot with spaces in its name, landing in the session's own files folder, which the relay makes and names in the command in place of Skelcrew's marker, and never in another session's. Where bubblewrap can make namespaces, a sandboxed agent reads its own drops whole, a screenshot and a valid PDF with spaces in their names, by the path hc gives. It can't write beside them, and can't see another session's
 
 Tested with hc 0.1.21.
 
@@ -130,6 +131,19 @@ Tested with hc 0.1.21.
 - **A paste without Enter.** `send` is always paste then Enter. That covers `deliver`, but not the `paste` that the v6 sessions table lists for the built-in transport. That transport isn't needed on hc, since hc's own is better, so this plugin has no `paste`.
 - **Skelcrew's detach key.** `hc attach` detaches only with a Ctrl chord, Ctrl+\ by default, from the person's config. Ctrl-Q, which tmux sessions also take, needs `detach_key = "ctrl+q"` there. Alt-Q can't work.
 - **A draft hold of its own.** hc holds a delivery for a person's draft only as long as their `draft_wait`, then types on top. Nothing outside hc can see a draft the screen doesn't show, so only the person's config keeps every draft safe.
+
+## Files dropped into a session
+
+A file a person drops into an agent's session in herdr, such as a screenshot or a PDF, goes to hc's `terminal.put`. hc saves it in the terminal's own folder, `files/<address>` in the core's state folder, such as `~/.local/state/herdr-core/default/files/t1z/`, and herdr types its path to the agent. hc keeps nothing else there, makes the folder at the first drop, and removes it with the terminal. A name's spaces become `_`, and a name already taken gets a suffix. hc has no setting for another folder, and the path it types is always this one, even when the folder is a link elsewhere.
+
+Skelcrew's sandbox hides the home folder, so the agent can open a dropped file only if its sandbox shows that folder. Showing it is Skelcrew's job, as it builds the sandbox, but the folder's name is the session's hc address, which hc gives only once the terminal starts, after the sandbox's command is built. So:
+
+- **Skelcrew** puts a marker where the folder goes: a path of its own, `/skelcrew-files-` and 32 hex digits, mounted read-only (`--ro-bind <marker> <marker>` for bubblewrap). It passes the marker to `start` as `files`.
+- **The relay** makes the session's folder, empty and only its owner's, and puts its path in place of every occurrence of the marker before it starts the agent. It knows the folder as hc does: the relay runs with the core's own environment (`XDG_STATE_HOME`, `HC_SESSION`) and the terminal's `HC_TERMINAL_ID`.
+
+So each agent sees its own session's drops, read-only, and no other session's. Without `files`, the command runs as given, and the agent can't open what is dropped.
+
+**Not working yet.** Skelcrew doesn't pass `files` or mount the marker yet, so in real sessions, leads and builders alike, agents still can't open dropped files. That waits on a change in Skelcrew's sandbox. Until it lands, nobody has seen a dropped screenshot show as `[Image 1]` in Claude Code, or an agent read a dropped PDF.
 
 ## How status reaches herdr
 
