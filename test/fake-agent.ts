@@ -8,6 +8,7 @@
 const write = (text: string) => process.stdout.write(text);
 write(`argv: ${JSON.stringify(process.argv.slice(2))}\r\n`);
 write(`cwd: ${process.cwd()}\r\n`);
+write(`pid: ${process.pid}\r\n`);
 write(`env: ${JSON.stringify(Object.keys(process.env).sort())}\r\n`);
 const { TERM, COLORTERM, TERM_PROGRAM } = process.env;
 write(`terminal: ${JSON.stringify([TERM, COLORTERM, TERM_PROGRAM])}\r\n`);
