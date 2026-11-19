@@ -34,7 +34,7 @@ hc ls --label by=skelcrew
 hc ls --label repo=simon/app
 ```
 
-**Workspaces in herdr's app.** Each repository gets a workspace named after it, such as `skelcrew/skelcrew`, with a tab per session: `lead` first, then each builder under its thread's name, such as `skelcrew-430`. A restarted agent takes over its thread's tab, and ending a session closes its tab, and its workspace once that is empty. The app keeps its workspaces in the hc document `herdr-app`. The plugin writes that document only if nobody wrote it since it was read, so nothing you change in the app is lost. Each terminal also gets the app's labels, `herdr.space`, `herdr.tab` and `where`, so `hc ls` says where it is. Leads still run on tmux, and reviewers run headless, so neither has a tab yet.
+**Workspaces in herdr's app.** Each repository gets a workspace named after it without its owner, such as `skelcrew`, with a tab per session. The lead's tab, `lead`, goes first. A builder's tab is the thread's title as Skelcrew shows it, its short title when it has one, if Skelcrew passes `title` in the session's labels. Otherwise it is the thread's number, such as `430`. So the app lists an agent as `skelcrew · Tabs for agents`. Two repositories with the same name under different owners share a workspace. A restarted agent takes over its thread's tab, and ending a session closes its tab, and its workspace once that is empty. The app keeps its workspaces in the hc document `herdr-app`. The plugin writes that document only if nobody wrote it since it was read, so nothing you change in the app is lost. Each terminal also gets the app's labels, `herdr.space`, `herdr.tab` and `where`, so `hc ls` says where it is. Leads still run on tmux, and reviewers run headless, so neither has a tab yet.
 
 herdr shows each agent as its harness, `claude` or `codex`, from the `app` the relay puts in every status report. Until Skelcrew's first report, it shows the relay's own program.
 
@@ -52,7 +52,7 @@ echo '{"ask":"list"}' | bun src/call.ts
 
 | `ask` | Takes | Answers | On hc |
 | --- | --- | --- | --- |
-| `start` | `name`, `command`, `folder`, `env`, `labels` (`repository`, `role`, `task`) | `id`, the terminal's hc address, such as `t7` | `terminal.run` (`hc run --bg --no-parent --cwd --label`), with the environment handed to the relay |
+| `start` | `name`, `command`, `folder`, `env`, `labels` (`repository`, `role`, `task`, and `title` for its tab) | `id`, the terminal's hc address, such as `t7` | `terminal.run` (`hc run --bg --no-parent --cwd --label`), with the environment handed to the relay |
 | `list` | | `sessions`: each with `id`, `running` and `labels` | `terminal.list` with the `by=skelcrew` label |
 | `read` | `id` | `screen` | `terminal.read` (`hc read`) |
 | `keys` | `id`, `key`: `Enter` or `Escape` | | `terminal.keys` (`hc keys`) |

@@ -26,11 +26,13 @@ import { place, unplace } from "./workspaces.ts";
 export const Id = z.string().regex(/^[a-z0-9_-]{1,32}$/, "1-32 of a-z, 0-9, - and _");
 
 // What every session carries, as Skelcrew gives them: its repository as owner/name, its role,
-// and for a builder its task, such as app-12.
+// and for a builder its task, such as app-12, and the title Skelcrew shows for it, its short
+// title when it has one, which names its tab in herdr's app.
 export const Labels = z.object({
   repository: z.string().min(1),
   role: z.enum(["lead", "builder"]),
   task: z.string().min(1).optional(),
+  title: z.string().min(1).optional(),
 });
 export type Labels = z.infer<typeof Labels>;
 
