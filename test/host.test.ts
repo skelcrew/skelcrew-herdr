@@ -169,6 +169,23 @@ describe.skipIf(!bin)("sessions on herdr-core", () => {
     expect(shown).toContain(`terminal: ${JSON.stringify(["dumb", "custom", "custom"])}`);
   }, 15_000);
 
+  test("an environment value is on no process's command line, nor in hc's record", async () => {
+    const token = `secret-${crypto.randomUUID()}`;
+    const session = await startSession({
+      name: "token",
+      command: [process.execPath, fakeAgent],
+      folder: scratch,
+      env: { PATH: "/usr/bin:/bin", FAKE_TOKEN: token },
+      labels: { repository: "simon/app", role: "builder" },
+    });
+    await screenShows(session, `token: ${token}`);
+    // Any local user can read every process's command line with ps, but only its owner can
+    // read its environment. hc's record of the terminal is shown by hc get and herdr's apps.
+    const ps = Bun.spawnSync(["ps", "-A", "-ww", "-o", "pid=,args="]).stdout.toString();
+    expect(ps.split("\n").filter((line) => line.includes(token))).toEqual([]);
+    expect(JSON.stringify(await rpc("terminal.get", { terminal: session }))).not.toContain(token);
+  }, 15_000);
+
   test("start sets an environment name that starts with -, rather than reading it as an option", async () => {
     const session = await startSession({
       name: "dash-env",
