@@ -1,6 +1,6 @@
 # skelcrew-herdr
 
-Skelcrew's runtime plugin for [herdr-core](https://github.com/herdrdev/herdr-core) (`hc`). It runs Skelcrew's builders in hc terminals instead of tmux, so herdr's apps show them, and provides Skelcrew's sessions, transport and status base modules. Leads stay on tmux for now.
+Skelcrew's runtime plugin for [herdr-core](https://github.com/herdrdev/herdr-core) (`hc`). It runs Skelcrew's builders in hc terminals instead of tmux, where hc and herdr can show them. It provides Skelcrew's sessions, transport and status base modules. Leads stay on tmux for now.
 
 ## Try it
 
@@ -12,6 +12,28 @@ sc plugin install skelcrew/skelcrew-herdr
 ```
 
 Then set `session: herdr` in `~/.config/skelcrew/config.yaml`. New builders start on herdr. Builders already running stay on tmux until they end. In `sc --list`, Enter on a builder attaches to it full screen, and Ctrl-Q brings you back. Alt-Q, which also leaves a tmux session, doesn't work here.
+
+## Seeing Skelcrew's agents from herdr
+
+Skelcrew's agents run on an hc session of their own, `skelcrew`, not on hc's default one (see below for why). So hc and herdr's apps show them only when they look at that session:
+
+```sh
+HC_SESSION=skelcrew hc ls --label by=skelcrew
+```
+
+Run this only while Skelcrew's core runs, which it does once a builder has started. Any hc command starts a core when none runs, and one started that way reads your own hc config. This plugin then refuses that core, so no builder can start until you stop it with `HC_SESSION=skelcrew hc server stop`.
+
+Each terminal carries the labels `repo`, `role`, `task` and `name`, so you can filter by them, such as `--label repo=simon/app`.
+
+**Agents on a server.** To see a server's agents from your laptop, add the server's `skelcrew` session as an hc machine:
+
+```sh
+hc machine add you@server --name server-crew --session skelcrew
+```
+
+The same rule holds there: add it once Skelcrew runs on the server, or the first connection may start a core the plugin refuses. This is separate from `sc --remote`. `sc --remote server --list` runs Skelcrew's list on the server over ssh, and Enter there runs `hc attach` on the server.
+
+Whether herdr's desktop and phone apps can show a session other than the default isn't known yet. See the open questions below.
 
 ## How Skelcrew calls it
 
