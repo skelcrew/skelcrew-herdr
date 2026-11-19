@@ -108,7 +108,7 @@ The installer doesn't start a core. The fake agent, `test/fake-agent.ts`, prints
 - `end`
 - the status hc shows after each report, through the relay, which refuses anything but a report
 - the agent's exit code passing through the relay, and `end` ending the agent under it
-- a dropped file, a PDF or a screenshot with spaces in its name, landing in the session's own files folder, which the relay makes and names in the command in place of Skelcrew's marker, and never in another session's. Where bubblewrap can make namespaces, a sandboxed agent reads its own drops, read-only, and can't see another session's
+- a dropped file, a PDF or a screenshot with spaces in its name, landing in the session's own files folder, which the relay makes and names in the command in place of Skelcrew's marker, and never in another session's. Where bubblewrap can make namespaces, a sandboxed agent reads its own drops whole, a screenshot and a valid PDF with spaces in their names, by the path hc gives. It can't write beside them, and can't see another session's
 
 Tested with hc 0.1.21.
 

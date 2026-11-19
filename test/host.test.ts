@@ -2,7 +2,7 @@
 // config and socket folders, so the machine's own core and its terminals are never touched.
 // Without hc on PATH (or HC_BIN), they are skipped, and say so.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   chmodSync,
   existsSync,
@@ -1029,6 +1029,30 @@ describe.skipIf(!bin)("a session's lock", () => {
   }, 20_000);
 });
 
+// A small PDF a reader opens, showing `text` on one page: its cross-reference table gives each
+// object's true byte offset, as the format requires.
+function validPdf(text: string) {
+  const stream = `BT /F1 24 Tf 72 720 Td (${text}) Tj ET`;
+  const objects = [
+    "<< /Type /Catalog /Pages 2 0 R >>",
+    "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>",
+    `<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`,
+    "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+  ];
+  let body = "%PDF-1.4\n";
+  const offsets = objects.map((object, i) => {
+    const at = body.length;
+    body += `${i + 1} 0 obj\n${object}\nendobj\n`;
+    return at;
+  });
+  const xref = body.length;
+  body += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  for (const at of offsets) body += `${String(at).padStart(10, "0")} 00000 n \n`;
+  body += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
+  return new TextEncoder().encode(body);
+}
+
 // Files a person drops into a session in herdr: hc puts each in the terminal's own files folder
 // and types its path to the agent, so the agent's sandbox must show that folder, and no other.
 describe.skipIf(!bin)("files dropped into a session", () => {
@@ -1044,7 +1068,7 @@ describe.skipIf(!bin)("files dropped into a session", () => {
   // The marker Skelcrew puts in the command where the session's files folder goes.
   const marker = () => `/skelcrew-files-${randomBytes(16).toString("hex")}`;
   // A small PDF and PNG, as a person drops them.
-  const pdf = new TextEncoder().encode("%PDF-1.4\n1 0 obj << >> endobj\ntrailer << >>\n%%EOF\n");
+  const pdf = validPdf("Dropped into a session");
   const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
 
   // Starts the fake agent with the marker in its command, as the sandbox's mount would hold it.
@@ -1117,10 +1141,13 @@ describe.skipIf(!bin)("files dropped into a session", () => {
       const theirs = await drop(other.session, "theirs.png", png);
       const files = marker();
       const state = join(scratch, "state");
-      // The agent's side: it reads what is dropped into its folder, and tries the other's.
+      // The agent's side: it reads each file whose path is typed to it, as herdr types a drop's,
+      // whole, and shows its checksum, then tries the other session's folder and to write beside
+      // the drop. Each answer goes on a line of its own, numbered by the drop.
       const script =
-        'echo ready; while read -r path; do cat "$path" >/dev/null && echo "read: $path";' +
-        ' ls "$1" >/dev/null 2>&1 || echo "hidden: $1"; touch "$path.new" 2>/dev/null || echo "read-only"; done';
+        'echo ready; n=0; while read -r path; do n=$((n+1)); sum=$(sha256sum < "$path" | cut -c1-64) &&' +
+        ' echo "read $n: $sum"; ls "$1" >/dev/null 2>&1 || echo "hidden $n"; touch "$path.new" 2>/dev/null ||' +
+        ' echo "read-only $n"; done';
       const session = await startSession({
         name: "drops-5",
         command: [
@@ -1134,11 +1161,19 @@ describe.skipIf(!bin)("files dropped into a session", () => {
         files,
       });
       await screenShows(session, "ready");
-      const ours = await drop(session, "My screenshot.png", png);
-      await rpc("terminal.send", { terminal: session, text: ours.path });
-      const shown = await screenShows(session, "read-only");
-      expect(shown).toContain(`read: ${ours.path}`);
-      expect(shown).toContain(`hidden: ${dirname(theirs.path)}`);
+      const sha = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
+      // A screenshot and a valid PDF, both with spaces in their names, as a person drops them.
+      const drops: [string, Uint8Array][] = [
+        ["My screenshot.png", png],
+        ["Quarterly report 2026.pdf", pdf],
+      ];
+      for (const [n, [name, bytes]] of drops.entries()) {
+        const ours = await drop(session, name, bytes);
+        await rpc("terminal.send", { terminal: session, text: ours.path });
+        const shown = await screenShows(session, `read-only ${n + 1}`);
+        expect(shown).toContain(`read ${n + 1}: ${sha(bytes)}`);
+        expect(shown).toContain(`hidden ${n + 1}`);
+      }
     },
     20_000,
   );
