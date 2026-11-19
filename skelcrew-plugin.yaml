@@ -1,5 +1,5 @@
 name: herdr
-version: 0.1.1
+version: 0.1.2
 skelcrew: 0.1.3
 about: Runs Skelcrew's builders in herdr-core, so herdr's apps show them
 kind: runtime

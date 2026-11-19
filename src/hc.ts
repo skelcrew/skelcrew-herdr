@@ -20,13 +20,16 @@ export class HcError extends Error {
 }
 
 export const hcBin = () => process.env.HC_BIN || "hc";
-// hc's own session when none is chosen, the one herdr's apps show.
-const session = "default";
+// The hc sessions, each a core of its own, that hold Skelcrew's agents: hc's own session when
+// none is chosen, the one herdr's apps show, where agents start; and `skelcrew`, where version
+// 0.1.0 of this plugin started them, which may still run some.
+export type Core = "default" | "skelcrew";
+export const cores: Core[] = ["default", "skelcrew"];
 
 // The socket the person's default core listens on, found as hc 0.1.21 finds it on Linux and a
 // Mac: in the user's runtime folder (XDG_RUNTIME_DIR, else /run/user/<uid> when it exists), else
 // in the session's state folder, named for the session.
-export function coreSocket(): string {
+export function coreSocket(session: Core = "default"): string {
   const user = `/run/user/${process.getuid?.()}`;
   const run =
     process.env.XDG_RUNTIME_DIR ||
@@ -36,13 +39,13 @@ export function coreSocket(): string {
   return join(folder, `${session}.sock`);
 }
 
-// The environment for hc, reaching the person's default core. Inside an hc terminal, hc takes
+// The environment for hc, reaching the core `session`, the person's default one unless given. Inside an hc terminal, hc takes
 // HC_TERMINAL_ID as the caller, so a session started from there would become that terminal's
 // child and end with it, and a message sent from there would be marked as from it. Skelcrew's
 // engine is nobody's child, so both go. HC_SCOPE marks processes for hc's cleanup of an ended
-// terminal, which the engine isn't either, and HC_SOCKET and HC_SESSION would lead to another
-// core, one herdr's apps don't show.
-export function hcEnv(): Record<string, string | undefined> {
+// terminal, which the engine isn't either, and the caller's HC_SOCKET and HC_SESSION would lead
+// to another core.
+export function hcEnv(session: Core = "default"): Record<string, string | undefined> {
   const {
     HC_TERMINAL_ID: _id,
     HC_SCOPE: _scope,
@@ -50,7 +53,7 @@ export function hcEnv(): Record<string, string | undefined> {
     HC_SESSION: _session,
     ...env
   } = process.env;
-  return env;
+  return session === "default" ? env : { ...env, HC_SESSION: session };
 }
 
 // What the core's own environment keeps from this process's, when this program is the one that
@@ -84,7 +87,7 @@ export async function ensureCore(): Promise<void> {
 
 // Stops the default core, which ends every terminal on it. Only the tests use it.
 export async function stopCore(): Promise<void> {
-  await run(["server", "stop"], 30_000, hcEnv());
+  await run(["server", "stop"], 30_000, hcEnv("default"));
 }
 
 // Runs `hc <command> --json <args>` and returns its parsed answer, only for the server commands,
@@ -133,7 +136,8 @@ function parse(text: string): unknown {
   }
 }
 
-// Calls one API method on the person's default core over `hc connect`, and returns its result.
+// Calls one API method over `hc connect` on the core `session`, the person's default one unless
+// given, and returns its result.
 // The CLI is one call per command, but a send needs the connection: it can be given up on with
 // `$/cancelRequest`, which hc honours only while the send is still held, before typing: once it
 // typed, the send finishes. So at `deadline`, a time in milliseconds since the epoch, this asks
@@ -145,10 +149,19 @@ function parse(text: string): unknown {
 // Cancelling with an answer needs framed mode, so the connection switches to it first: each
 // frame is its channel (u32), kind (u8, 0 for data) and length (u32), little-endian, then the
 // JSON-RPC message, on channel 0.
-export async function rpc(method: string, params: object, deadline?: number): Promise<unknown> {
-  await ensureCore();
+export async function rpc(
+  method: string,
+  params: object,
+  deadline?: number,
+  session: Core = "default",
+): Promise<unknown> {
+  // Only the default core is started when none runs. Any hc command on another session would
+  // start one there, and the older session must end once its last agent does.
+  if (session === "default") await ensureCore();
+  else if (!existsSync(coreSocket(session)))
+    throw new HcError("not_found", `no hc core runs on session ${session}`);
   const child = Bun.spawn([hcBin(), "connect"], {
-    env: hcEnv(),
+    env: hcEnv(session),
     stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",
