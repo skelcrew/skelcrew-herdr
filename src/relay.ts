@@ -7,6 +7,7 @@
 // Usage: SKELCREW_AGENT_ENV=<json> bun src/relay.ts <socket> -- <command...>
 import { rmSync, writeSync } from "node:fs";
 import { constants } from "node:os";
+import { basename } from "node:path";
 import { z } from "zod";
 
 const [socket, dashes, ...command] = process.argv.slice(2);
@@ -21,10 +22,18 @@ const env = z
   .record(z.string(), z.string())
   .parse(JSON.parse(process.env.SKELCREW_AGENT_ENV ?? "{}"));
 
+// The harness the command runs, for herdr's apps, which show a terminal's agent by the `app` of
+// its reports, else by the relay's own program. Skelcrew starts its harnesses by these names,
+// inside the sandbox's own command, so the first word that names one is the harness.
+const app = command
+  .map((word) => basename(word))
+  .find((name) => ["claude", "codex"].includes(name));
+
 // Each connection carries one report: the OSC 7501 fields, such as `state=idle`, on one line.
 // They are written to the terminal in a single write, which the terminal keeps whole between two
 // of the agent's own writes, and `ok` goes back once it is written. Fields with anything but
-// letters, digits and `=:+/` are refused, so nothing else can reach the terminal this way.
+// letters, digits and `=:+/` are refused, so nothing else can reach the terminal this way. The
+// harness's name goes with every report, as each one replaces the last.
 const server = Bun.listen<{ text: string }>({
   unix: socket,
   socket: {
@@ -40,7 +49,7 @@ const server = Bun.listen<{ text: string }>({
         conn.end("refused\n");
         return;
       }
-      writeSync(1, `\x1b]7501;${fields}\x1b\\`);
+      writeSync(1, `\x1b]7501;${fields}${app ? `:app=${app}` : ""}\x1b\\`);
       conn.end("ok\n");
     },
   },
