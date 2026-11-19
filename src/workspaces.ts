@@ -1,5 +1,5 @@
-// Places Skelcrew's sessions in herdr's app: one workspace per repository, named like
-// skelcrew/skelcrew, with one tab per session, the lead's first. The app keeps its workspaces in
+// Places Skelcrew's sessions in herdr's app: one workspace per repository, named after it, such
+// as skelcrew, with one tab per session, the lead's first. The app keeps its workspaces in
 // an hc document on the core, `herdr-app`, and shows a terminal only once a tab there holds it.
 // Each placed terminal also carries labels naming its workspace and tab, as the app's own do.
 import { randomBytes } from "node:crypto";
@@ -46,24 +46,35 @@ async function update<T>(change: (layout: Layout) => T): Promise<T> {
   }
 }
 
-// The tab's name for a session: `lead` for the lead, else its task, such as skelcrew-430, else
-// Skelcrew's name for it.
-const tabName = (role: string, task: string | undefined, name: string) =>
-  role === "lead" ? "lead" : (task ?? name);
+// The app shows an agent as its workspace and its tab, such as `skelcrew · Tabs for agents`.
+// The workspace is the repository's name without its owner, which nearly all of them share. The
+// tab is `lead` for the lead, else the title Skelcrew shows for the thread, else its task without
+// the repository's name, such as 430 for skelcrew-430, as Skelcrew's own sidebar shows it.
+const spaceName = (repository: string) => repository.split("/").pop() || repository;
+function tabName(labels: Placed, name: string): string {
+  if (labels.role === "lead") return "lead";
+  if (labels.title) return labels.title;
+  const task = labels.task ?? name;
+  const prefix = `${spaceName(labels.repository)}-`;
+  return task.startsWith(prefix) && task.length > prefix.length ? task.slice(prefix.length) : task;
+}
+type Placed = {
+  repository: string;
+  role: string;
+  task?: string | undefined;
+  title?: string | undefined;
+};
 
 // Puts the terminal at `address` in a tab of its repository's workspace, making either when
 // missing. A tab of the same name, from an earlier session of the same thread, takes the new
 // terminal instead, so a restarted agent keeps its place. The lead's tab goes first.
-export async function place(
-  address: string,
-  labels: { repository: string; role: string; task?: string | undefined },
-  name: string,
-): Promise<void> {
-  const tab = tabName(labels.role, labels.task, name);
+export async function place(address: string, labels: Placed, name: string): Promise<void> {
+  const tab = tabName(labels, name);
+  const workspace = spaceName(labels.repository);
   const at = await update((layout) => {
-    let space = layout.spaces.find((s) => s.name === labels.repository);
+    let space = layout.spaces.find((s) => s.name === workspace);
     if (!space) {
-      space = { id: newId("sp"), name: labels.repository, folder: "", tabs: [] };
+      space = { id: newId("sp"), name: workspace, folder: "", tabs: [] };
       layout.spaces.push(space);
     }
     const block = { type: "block", id: newId("p"), content: { terminal: address } };
@@ -82,7 +93,7 @@ export async function place(
     labels: {
       "herdr.space": at.space,
       "herdr.tab": at.tab,
-      where: `${labels.repository} / ${tab}`,
+      where: `${workspace} / ${tab}`,
       "herdr.seen": "0",
     },
   });

@@ -385,7 +385,14 @@ describe.skipIf(!bin)("workspaces in herdr's app", () => {
     const own = { id: "spown", name: "", folder: "/home/a", tabs: [], color: "blue" };
     const kept = { spaces: [...(await layout()).spaces, own], theme: "dark" };
     await rpc("doc.set", { name: "herdr-app", value: kept, version });
-    const builder = await start("placed-1", { ...placed, role: "builder", task: "placed-1" });
+    // The short title Skelcrew shows for a thread, when it has one, else its number.
+    const builder = await start("placed-1", {
+      ...placed,
+      role: "builder",
+      task: "placed-1",
+      title: "Tabs for agents",
+    });
+    const untitled = await start("placed-2", { ...placed, role: "builder", task: "placed-2" });
     const lead = await start("lead-placed", { ...placed, role: "lead" });
     const after = await layout();
     const whole = z
@@ -393,12 +400,14 @@ describe.skipIf(!bin)("workspaces in herdr's app", () => {
       .parse(await rpc("doc.get", { name: "herdr-app" }));
     expect(whole.value.theme).toBe("dark");
     expect(whole.value.spaces).toContainEqual(own);
-    const space = after.spaces.find((s) => s.name === "simon/placed");
+    // The workspace is the repository's name, as its owner is the same for nearly all of them.
+    const space = after.spaces.find((s) => s.name === "placed");
     expect(
       space?.tabs.map((t) => [t.name, t.root.children.map((c) => c.content.terminal)]),
     ).toEqual([
       ["lead", [lead]],
-      ["placed-1", [builder]],
+      ["Tabs for agents", [builder]],
+      ["2", [untitled]],
     ]);
     // hc ls says where each one is, as for a terminal the app placed itself.
     const ls = Bun.spawnSync([bin ?? "hc", "ls", "--json"], { env: process.env });
@@ -407,12 +416,13 @@ describe.skipIf(!bin)("workspaces in herdr's app", () => {
         terminals: z.array(z.object({ address: z.string(), where: z.string().optional() })),
       })
       .parse(JSON.parse(ls.stdout.toString())).terminals;
-    expect(listed).toContainEqual({ address: builder, where: "simon/placed / placed-1" });
-    expect(listed).toContainEqual({ address: lead, where: "simon/placed / lead" });
+    expect(listed).toContainEqual({ address: builder, where: "placed / Tabs for agents" });
+    expect(listed).toContainEqual({ address: untitled, where: "placed / 2" });
+    expect(listed).toContainEqual({ address: lead, where: "placed / lead" });
     // Ending a session closes its tab.
     await host.end({ id: builder });
-    const ended = (await layout()).spaces.find((s) => s.name === "simon/placed");
-    expect(ended?.tabs.map((t) => t.name)).toEqual(["lead"]);
+    const ended = (await layout()).spaces.find((s) => s.name === "placed");
+    expect(ended?.tabs.map((t) => t.name)).toEqual(["lead", "2"]);
   }, 20_000);
 });
 
