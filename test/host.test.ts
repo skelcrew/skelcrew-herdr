@@ -1153,9 +1153,11 @@ describe.skipIf(!bin)("files dropped into a session", () => {
   test("the marker never exists on the host, and the command starts with a real folder in its place", async () => {
     const files = marker();
     // The command's side, as bwrap would see its mount: whether its source exists as it starts,
-    // and later, each file found there, by the path it was given at the start.
+    // and later, each file found there, by the path it was given at the start. The folder is
+    // shown by its checksum, of fixed width, so a long path or one with spaces reads whole.
     const script =
-      'if [ -d "$1" ]; then echo "folder at start: $1"; fi; echo ready;' +
+      'if [ -d "$1" ]; then echo "folder at start: $(printf %s "$1" | sha256sum | cut -c1-64)"; fi;' +
+      " echo ready;" +
       ' while read -r name; do [ -f "$1/$name" ] && echo "found: $name"; done';
     const session = await startSession({
       name: "drops-marker",
@@ -1166,9 +1168,10 @@ describe.skipIf(!bin)("files dropped into a session", () => {
       files,
     });
     const shown = await screenShows(session, "ready");
-    const folder = shown.match(/folder at start: (\S+)/)?.[1] ?? "";
-    expect(folder).not.toBe("");
-    expect(folder).not.toContain("skelcrew-files-");
+    // The session's own files folder, as hc names it in the tests' core's state.
+    const folder = join(scratch, "state", "herdr-core", "default", "files", session);
+    const sum = createHash("sha256").update(folder).digest("hex");
+    expect(shown).toContain(`folder at start: ${sum}`);
     expect(existsSync(files)).toBe(false);
     // A drop after the command started lands where the command already looks.
     const put = await drop(session, "Later drop.png", png);
