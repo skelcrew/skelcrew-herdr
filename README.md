@@ -1,6 +1,6 @@
 # skelcrew-herdr
 
-Skelcrew's runtime plugin for [herdr-core](https://github.com/herdrdev/herdr-core) (`hc`). It runs Skelcrew's builders in hc terminals instead of tmux, where hc and herdr can show them. It provides Skelcrew's sessions, transport and status base modules. Leads stay on tmux for now.
+Skelcrew's runtime plugin for [herdr-core](https://github.com/herdrdev/herdr-core) (`hc`). It runs Skelcrew's leads and builders in hc terminals instead of tmux, where hc and herdr can show them. It provides Skelcrew's sessions, transport and status base modules.
 
 ## Try it
 
@@ -11,7 +11,9 @@ curl -fsSL https://releases.herdr.dev/core/install.sh | HC_INSTALL_DIR=~/.local/
 sc plugin install skelcrew/skelcrew-herdr
 ```
 
-Then set `session: herdr` in `~/.config/skelcrew/config.yaml`. New builders start on herdr. Builders already running stay on tmux until they end. In `sc --list`, Enter on a builder attaches to it full screen, and your hc detach key brings you back.
+Then set `session: herdr` in `~/.config/skelcrew/config.yaml`. New leads and builders start on herdr. A lead or builder already running stays on tmux until it ends. Plain `sc` attaches you to the repository's lead full screen, through this plugin's attach, which runs `hc attach`. In `sc --list`, Enter on a builder attaches to it full screen the same way. Either way, your hc detach key brings you back.
+
+Not done yet: on herdr, Skelcrew can't tell a lead you exited, such as with `/exit`, from one you detached from ([skelcrew/skelcrew#483](https://github.com/skelcrew/skelcrew/issues/483)).
 
 The agents run on your own hc core, the one `hc` and herdr's apps show, so its config is yours. Set these in `~/.config/herdr-core/config.toml`:
 
@@ -34,7 +36,7 @@ hc ls --label by=skelcrew
 hc ls --label repo=simon/app
 ```
 
-**Workspaces in herdr's app.** Each repository gets a workspace named after it without its owner, such as `skelcrew`, with a tab per session. The lead's tab, `lead`, goes first. A builder's tab is the thread's title as Skelcrew shows it, its short title when it has one, if Skelcrew passes `title` in the session's labels. Otherwise it is the thread's number, such as `430`. So the app lists an agent as `skelcrew · Tabs for agents`. Two repositories with the same name under different owners share a workspace. A restarted agent takes over its thread's tab, and ending a session closes its tab, and its workspace once that is empty. The app keeps its workspaces in the hc document `herdr-app`. The plugin writes that document only if nobody wrote it since it was read, so nothing you change in the app is lost. Each terminal also gets the app's labels, `herdr.space`, `herdr.tab` and `where`, so `hc ls` says where it is. Leads still run on tmux, and reviewers run headless, so neither has a tab yet.
+**Workspaces in herdr's app.** Each repository gets a workspace named after it without its owner, such as `skelcrew`, with a tab per session. The lead's tab, `lead`, goes first. A builder's tab is the thread's title as Skelcrew shows it, its short title when it has one, if Skelcrew passes `title` in the session's labels. Otherwise it is the thread's number, such as `430`. So the app lists an agent as `skelcrew · Tabs for agents`. Two repositories with the same name under different owners share a workspace. A restarted agent takes over its thread's tab, and ending a session closes its tab, and its workspace once that is empty. The app keeps its workspaces in the hc document `herdr-app`. The plugin writes that document only if nobody wrote it since it was read, so nothing you change in the app is lost. Each terminal also gets the app's labels, `herdr.space`, `herdr.tab` and `where`, so `hc ls` says where it is. Reviewers run headless, so they have no tab.
 
 herdr shows each agent as its harness, `claude` or `codex`, from the `app` the relay puts in every status report. Until Skelcrew's first report, it shows the relay's own program.
 
