@@ -163,14 +163,11 @@ So a prompt-injected agent can pass for the lead.
   - Skelcrew's own notes to leads and messages to builders (review changes, PR comments, a refused push), which go in as bare text today.
 
   IDs are random and never reused for another message.
-- **Pending until handled, then handled for good.** The daemon keeps each message, with its receiver, sender, reply address, exact text and a state, for as long as its receiver exists: the thread until it is removed, or the repository's lead. A message is *pending* from when it is typed in until it has been handled, and *handled* from then on. It never goes back. It counts as handled when any of these happens:
-  - **A turn ends normally after it went in.** Skelcrew types a message in only when the agent is idle, so the message starts a turn. The harness's turn-end hook, which Skelcrew already receives as `turn ended`, marks every message still pending in that session as handled, as the agent had them in front of it. A turn that is interrupted or fails (`turn interrupted`, `turn failed`), or a session that ends or restarts mid-turn, leaves them pending until a later turn in the same session ends normally.
-  - **The agent says so.** `sc message <id> --done` marks one handled at once, such as when a long turn has acted on one message and goes on to other work.
-  - **The human or the lead drops it.** For example, after an interruption meant to stop it.
+- **Pending until handled, then handled for good.** The daemon keeps each message, with its receiver, sender, reply address, exact text and a state, for as long as its receiver exists: the thread until it is removed, or the repository's lead. A message is *pending* from when it is typed in until it has been handled, and *handled* from then on. It never goes back. What marks a message handled is undecided: see open question 1. The agent can always mark one with `sc message <id> --done`, and the human or the lead can drop one. Whether a turn's end also marks it handled, and which turn's end, is the open part.
 
   A pending message's record also says whether a turn that received it was cut short, and when: by an interruption, a failure or a restart.
 - **Picking up after an interruption.** Each kind of interruption is handled differently:
-  - **The session keeps running** (the human pressed Esc, or the turn failed). The message is still in the agent's context, so it isn't typed again: an interruption is often the human stopping it on purpose. It stays pending until the agent's next turn ends normally, and `sc ps` counts it.
+  - **The session keeps running** (the human pressed Esc, or the turn failed). The message is still in the agent's context, so it isn't typed again: an interruption is often the human stopping it on purpose. It stays pending until it is marked handled (open question 1), and `sc ps` counts it.
   - **The session restarted** and lost its context, such as after a crash or `sc start` on a stopped thread. When the new session first goes idle, the daemon types every message still pending for it in again, in order, as its queue does today. Each keeps its ID and gets `resumed="yes"` in the wrapper. None is stranded.
   - **At any time**, `sc message --pending` lists the caller's pending IDs, with whether each was cut short. An agent can check it after its context was compacted, or whenever it isn't sure.
 - **Recovery can't promise once-only actions.** A turn cut short may already have done part of what the message asked, such as pushing a commit, commenting on a PR, or starting a thread, before it could report the message handled. No design can make that exactly-once: the cut can fall between the action and the report. So a message that was cut short is never simply done again. `sc message` prints it marked "cut short at <time>". The agent then:
@@ -188,10 +185,11 @@ So a prompt-injected agent can pass for the lead.
 
 - **Tests:**
   - a pending message prints its exact text, and prints it again on a second lookup, including after the daemon restarts;
-  - a turn that is interrupted or fails leaves the message pending and marked cut short. It isn't typed again, and the next turn that ends normally in that session marks it handled;
+  - a turn that is interrupted or fails leaves the message pending and marked cut short, and it isn't typed again;
   - a session that restarts with messages pending gets each one typed in again once idle, with the same ID and `resumed="yes"`, and `sc message` prints it marked cut short;
   - `sc message --pending` lists exactly the caller's pending IDs;
-  - once a turn ends normally after a message, or after `--done`, a lookup answers "already handled" with no text to act on;
+  - after `--done`, a lookup answers "already handled" with no text to act on;
+  - the tests in open question 1, whichever way it is decided;
   - **replay:** after a message is handled, typing its wrapper and ID into the agent again gets "already handled", and the daemon records nothing as newly delivered;
   - a handled message never becomes pending again, even after a daemon restart;
   - another agent's ID and a made-up ID answer "no such message";
@@ -203,7 +201,9 @@ So a prompt-injected agent can pass for the lead.
 
 These are left open, for whoever builds A:
 
-1. **Closing an interrupted message.** A turn that runs after an interruption, such as one answering an unrelated question from the human, must not mark a pending message handled when it never finished it. The design above links a message only to the turn it started, and closes a cut-short message only with an explicit `--done` from the agent or a `--drop` from the human or lead. Whether that link between a turn and its message can be kept reliably, across hooks, harnesses and restarts, is open. Either way, the tests must include an unrelated turn after an interruption, which they do. A normal turn end isn't proof either. An agent can receive a message, ask the human or its lead a question about it, and end its turn normally without having done what it asks. Under the design above, that turn's end marks the message handled: a later lookup can't recover its text, and a restart won't type it in again. So closing a message on a normal turn end may have to give way to explicit acknowledgement only (`--done`), with the turn end at most a reminder. The tests must cover a turn that ends normally after asking about a message, and check that the message stays pending.
+1. **When a message counts as handled.** A turn after an interruption, such as one answering an unrelated question from the human, can mark a pending message handled without finishing it. So can a turn that ends normally after the agent only asked the human or its lead a question about the message. Either way, a later lookup can't recover its text, and a restart won't type it in again. Closing a message therefore needs explicit acknowledgement from the agent (`--done`), or a reliable link between a turn and the message it finished. Which one is undecided. Whichever it is, the tests must include:
+   - an unrelated turn after an interruption, after which the message is still pending;
+   - a turn that ends normally after asking about a message, after which the message is still pending.
 2. **Bare text passing for the human.** A sends no confirmation for bare text, and to the agent a sender's bare text looks exactly like the human's own typing. A therefore proves only that a message claiming to be from Skelcrew or its agents really is. It can't stop a forger who writes as if they were the human. Nothing in Skelcrew can stop that, as the human types into the same terminal. Only a host that marks every input that isn't a person's (condition 4), with every agent contained, could. A's claim is limited to that.
 3. **Crashing during delivery.** The daemon could die between typing a message in and recording that it did. The agent then holds a message `sc message` can't confirm, or recovery never learns it went in. One answer:
    - record the message durably as *sending* before typing it, with `sc message` confirming it from then on;
