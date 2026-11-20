@@ -1145,6 +1145,38 @@ describe.skipIf(!bin)("files dropped into a session", () => {
     expect(existsSync(folder)).toBe(false);
   }, 15_000);
 
+  // The marker is only a word in the command, never a path on the host: the relay puts the real
+  // folder in its place, and makes it, before the command runs, so a sandbox started by that
+  // command, such as bwrap's `--ro-bind <folder> <folder>`, mounts a folder that exists, at its
+  // real path. Nothing is swapped once the command runs: what hc saves later lands in the very
+  // folder the command was given.
+  test("the marker never exists on the host, and the command starts with a real folder in its place", async () => {
+    const files = marker();
+    // The command's side, as bwrap would see its mount: whether its source exists as it starts,
+    // and later, each file found there, by the path it was given at the start.
+    const script =
+      'if [ -d "$1" ]; then echo "folder at start: $1"; fi; echo ready;' +
+      ' while read -r name; do [ -f "$1/$name" ] && echo "found: $name"; done';
+    const session = await startSession({
+      name: "drops-marker",
+      command: ["sh", "-c", script, "sh", files],
+      folder: scratch,
+      env: { PATH: "/usr/bin:/bin" },
+      labels: { repository: "simon/app", role: "builder" },
+      files,
+    });
+    const shown = await screenShows(session, "ready");
+    const folder = shown.match(/folder at start: (\S+)/)?.[1] ?? "";
+    expect(folder).not.toBe("");
+    expect(folder).not.toContain("skelcrew-files-");
+    expect(existsSync(files)).toBe(false);
+    // A drop after the command started lands where the command already looks.
+    const put = await drop(session, "Later drop.png", png);
+    expect(dirname(put.path)).toBe(folder);
+    await rpc("terminal.send", { terminal: session, text: basename(put.path) });
+    await screenShows(session, `found: ${basename(put.path)}`);
+  }, 15_000);
+
   test("each session's drops land in its own folder, never another's", async () => {
     const one = await startWithFiles("drops-2");
     const two = await startWithFiles("drops-3");

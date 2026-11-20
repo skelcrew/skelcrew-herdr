@@ -108,7 +108,7 @@ The installer doesn't start a core. The fake agent, `test/fake-agent.ts`, prints
 - `end`
 - the status hc shows after each report, through the relay, which refuses anything but a report
 - the agent's exit code passing through the relay, and `end` ending the agent under it
-- a dropped file, a PDF or a screenshot with spaces in its name, landing in the session's own files folder, which the relay makes and names in the command in place of Skelcrew's marker, and never in another session's. Where bubblewrap can make namespaces, a sandboxed agent reads its own drops whole, a screenshot and a valid PDF with spaces in their names, by the path hc gives. It can't write beside them, and can't see another session's
+- a dropped file, a PDF or a screenshot with spaces in its name, landing in the session's own files folder, which the relay makes and names in the command in place of Skelcrew's marker before the command runs, and never in another session's. The marker never exists on the host, and a drop made after the command started lands where it already looks. Where bubblewrap can make namespaces, a sandboxed agent reads its own drops whole, a screenshot and a valid PDF with spaces in their names, by the path hc gives. It can't write beside them, and can't see another session's
 
 Tested with hc 0.1.21.
 
@@ -142,6 +142,13 @@ Skelcrew's sandbox hides the home folder, so the agent can open a dropped file o
 - **The relay** makes the session's folder, empty and only its owner's, and puts its path in place of every occurrence of the marker before it starts the agent. It knows the folder as hc does: the relay runs with the core's own environment (`XDG_STATE_HOME`, `HC_SESSION`) and the terminal's `HC_TERMINAL_ID`.
 
 So each agent sees its own session's drops, read-only, and no other session's. Without `files`, the command runs as given, and the agent can't open what is dropped.
+
+The marker is only a word in the sandbox's command, never a path on the host:
+
+- **It needs no root, and never exists.** The relay puts the real folder in its place in the command's arguments, such as `--ro-bind <folder> <folder>`, before it runs the command. bubblewrap never sees the marker, and mounts a folder in the person's own state folder that the relay already made. So Skelcrew doesn't create anything at `/`. It only writes the marker into the arguments it builds, and mustn't check that it exists or resolve it while building them.
+- **Nothing is swapped after the sandbox starts.** The swap happens before the sandbox exists, so bubblewrap mounts the session's real folder from the start. hc saves every later drop into that same folder, which the mount shows as it changes.
+
+The tests show both: the command starts with a real folder where the marker was, the marker never exists on the host, and a drop made after the command started lands where it already looks.
 
 **Not working yet.** Skelcrew doesn't pass `files` or mount the marker yet, so in real sessions, leads and builders alike, agents still can't open dropped files. That waits on a change in Skelcrew's sandbox. Until it lands, nobody has seen a dropped screenshot show as `[Image 1]` in Claude Code, or an agent read a dropped PDF.
 
