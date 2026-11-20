@@ -67,7 +67,7 @@ Each forged message looks exactly like a real one.
 - every agent the person runs in herdr outside Skelcrew. herdr's manual teaches each one `hc send`, and `hc ls` lists Skelcrew's agents by name;
 - every other program the person runs.
 
-So a herdr agent that has been prompt-injected, for example by a web page or an issue it read, could send `hc send skelcrew-430 '<skelcrew from="lead" …>'` today. This exposure already exists, `notes = true` or not, and it came with running Skelcrew's agents on the person's default core. On tmux, Skelcrew's own tmux server can be reached by the same user's processes too, but nothing teaches agents to type into it. Either way, the receiving agent today has no way to tell a forged `<skelcrew>` message from a real one. Proposal A, "Messages agents can confirm", closes that gap.
+So a herdr agent that has been prompt-injected, for example by a web page or an issue it read, could send `hc send skelcrew-430 '<skelcrew from="lead" …>'` today. This exposure already exists, `notes = true` or not, and it came with running Skelcrew's agents on the person's default core. On tmux, Skelcrew's own tmux server can be reached by the same user's processes too, but nothing teaches agents to type into it. Either way, the receiving agent today has no way to tell a forged `<skelcrew>` message from a real one. Proposal A, "Messages agents can confirm", closes that gap for text that claims to come from Skelcrew or its agents. It doesn't stop a sender typing bare text, which looks like the human's own typing (see "Open questions").
 
 **What would make hc's marking trustworthy.** First, what no design can do. A program that runs unsandboxed as the person can do anything the person can:
 - connect to any socket the person can, read any file, and read other processes' environments and memory;
@@ -202,6 +202,19 @@ So a prompt-injected agent can pass for the lead.
   - a message without an ID gets no confirmation;
   - a removed thread's messages are gone.
 - **The limit.** A program running unsandboxed as the person can use any agent's Skelcrew socket, so it can still send a real message. This guards against everything that runs contained.
+
+### Open questions on A
+
+These are left open, for whoever builds A:
+
+1. **Closing an interrupted message.** A turn that runs after an interruption, such as one answering an unrelated question from the human, must not mark a pending message handled when it never finished it. The design above links a message only to the turn it started, and closes a cut-short message only with an explicit `--done` from the agent or a `--drop` from the human or lead. Whether that link between a turn and its message can be kept reliably, across hooks, harnesses and restarts, is open. Either way, the tests must include an unrelated turn after an interruption, which they do.
+2. **Bare text passing for the human.** A sends no confirmation for bare text, and to the agent a sender's bare text looks exactly like the human's own typing. A therefore proves only that a message claiming to be from Skelcrew or its agents really is. It can't stop a forger who writes as if they were the human. Nothing in Skelcrew can stop that, as the human types into the same terminal. Only a host that marks every input that isn't a person's (condition 4), with every agent contained, could. A's claim is limited to that.
+3. **Crashing during delivery.** The daemon could die between typing a message in and recording that it did. The agent then holds a message `sc message` can't confirm, or recovery never learns it went in. One answer:
+   - record the message durably as *sending* before typing it, with `sc message` confirming it from then on;
+   - record it as *pending* once `deliver` returns;
+   - after a daemon restart, type any message still *sending* in again, with the same ID and `resumed="yes"`, so the agent sees an ID it may already have and acts on it only once.
+
+   That design and its tests (the daemon killed before typing, and between typing and recording) are open.
 
 ### B. Escaping `<hc>` tags: merged as skelcrew/skelcrew PR #471
 
